@@ -1,0 +1,16 @@
+Command: cmake -G Ninja -B /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/build -DPYTHON_DEPS_CHECKED=1 -DPYTHON=/home/thevien257/.espressif/python_env/idf6.0_py3.12_env/bin/python -DESP_PLATFORM=1 -DCCACHE_ENABLE=False /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart
+Configuration Report                                                            
+ ────────────────────────────────────────────────────────────────────────────── 
+   Parser Version: 1                                                            
+   Verbosity: default                                                           
+   Defaults policy: sdkconfig                                                   
+   Status: Finished with notifications                                          
+                                                                                
+  Disabled Symbols/Choices With User-Set Value                                  
+   ──────────────────────────────────────────────────────────────────────────   
+    * ESP_CONSOLE_UART_BAUDRATE (defined at                                     
+    /home/thevien257/.espressif/v6.0/esp-idf/components/esp_stdio/Kconfig:1…    
+    with user-set value 115200 from                                             
+    /home/thevien257/tmp/kconfgen_tmp8ksanixn                                   
+   ──────────────────────────────────────────────────────────────────────────   
+ ────────────────────────────────────────────────────────────────────────────── 

@@ -9,16 +9,31 @@
 
 // ============================================================
 // PIN DEFINITIONS
-// PA6  = TRIG (GPIO output)
-// PA7  = ECHO (TIM2 CH3 input capture, AF1)
+// PA6  = TRIG1 Front  (GPIO output)
+// PA7  = ECHO1 Front  (TIM2 CH3 input capture, AF1)
+// PA4  = TRIG2 Right  (GPIO output)
+// PA1  = ECHO2 Right  (TIM2 CH2 input capture, AF1)
+// PA5  = TRIG3 Left   (GPIO output)
+// PB0  = ECHO3 Left   (TIM3 CH3 input capture, AF2)
+// PB8  = TRIG4 Rear   (GPIO output)
+// PB1  = ECHO4 Rear   (TIM3 CH4 input capture, AF2)
 // PB10 = FDCAN1 TX (AF9)
 // PB12 = FDCAN1 RX (AF9)
 // PC13 = LED blink
 // ============================================================
-#define TRIG_PORT               GPIOA
-#define TRIG_PIN                GPIO_PIN_6
+#define TRIG1_PORT              GPIOA
+#define TRIG1_PIN               GPIO_PIN_6
 
-// TIM2 @ 1MHz
+#define TRIG2_PORT              GPIOA
+#define TRIG2_PIN               GPIO_PIN_4
+
+#define TRIG3_PORT              GPIOA
+#define TRIG3_PIN               GPIO_PIN_5
+
+#define TRIG4_PORT              GPIOB
+#define TRIG4_PIN               GPIO_PIN_8
+
+// TIM2 & TIM3 @ 1MHz (Prescaler = 250-1 at 250MHz)
 #define SONAR_PERIOD_US         20000
 #define TRIG_PULSE_US           10
 #define US_TO_CM                58.0f
@@ -37,21 +52,25 @@
 // ============================================================
 // EVENT GROUP BITS
 // ============================================================
-#define EMERGENCY_STOP_BIT      ( 1 << 0 )  // bit 0 = obstacle detected
+#define EMERGENCY_STOP_BIT      ( 1 << 0 )
 
 // ============================================================
 // HANDLES & GLOBALS
 // ============================================================
 TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
 FDCAN_HandleTypeDef hfdcan1;
 
 static SemaphoreHandle_t printMutex = NULL;
-static SemaphoreHandle_t stopActiveSem = NULL; // suppress duplicate stops
-static SemaphoreHandle_t canTxMailboxSem = NULL; // mailbox 0/1 free signal
-static TaskHandle_t ultrasonicHandle = NULL;
+static SemaphoreHandle_t stopActiveSem = NULL;
+static SemaphoreHandle_t canTxMailboxSem = NULL;
 
-static QueueHandle_t obstacleQueue = NULL; // float distance
-static QueueHandle_t canTxQueue = NULL; // CAN_MsgTypeDef
+// One task handle per sensor — ISR notifies the right task
+static TaskHandle_t sonarHandle[4];  // [0]=Front [1]=Right [2]=Left [3]=Rear
+
+// One single-slot queue per sensor
+static QueueHandle_t obstacleQueue[4];
+static QueueHandle_t canTxQueue = NULL;
 
 static EventGroupHandle_t threatEventGroup = NULL;
 
@@ -61,10 +80,24 @@ typedef struct {
 	uint8_t data[8];
 } CAN_MsgTypeDef;
 
-// Shared volatile between ISR and ultrasonicTask
-static volatile uint32_t echoStart = 0;
-static volatile uint32_t echoEnd = 0;
-static volatile uint8_t capState = 0;
+// ============================================================
+// ISR SHARED VOLATILE — per sensor
+// ============================================================
+// Sensor 1 Front — TIM2 CH3
+static volatile uint32_t echo1Start = 0, echo1End = 0;
+static volatile uint8_t cap1State = 0;
+
+// Sensor 2 Right — TIM2 CH2
+static volatile uint32_t echo2Start = 0, echo2End = 0;
+static volatile uint8_t cap2State = 0;
+
+// Sensor 3 Left — TIM3 CH3
+static volatile uint32_t echo3Start = 0, echo3End = 0;
+static volatile uint8_t cap3State = 0;
+
+// Sensor 4 Rear — TIM3 CH4
+static volatile uint32_t echo4Start = 0, echo4End = 0;
+static volatile uint8_t cap4State = 0;
 
 // ============================================================
 // PRINT MACRO
@@ -81,11 +114,11 @@ static volatile uint8_t capState = 0;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
 static void MX_FDCAN1_Init(void);
 
 // ============================================================
-// FDCAN TX COMPLETE CALLBACK
-// Releases mailbox semaphore so canTxTask can send next frame
+// FDCAN TX FIFO EMPTY CALLBACK
 // ============================================================
 void HAL_FDCAN_TxFifoEmptyCallback(FDCAN_HandleTypeDef *hfdcan) {
 	if (hfdcan->Instance != FDCAN1)
@@ -96,136 +129,225 @@ void HAL_FDCAN_TxFifoEmptyCallback(FDCAN_HandleTypeDef *hfdcan) {
 }
 
 // ============================================================
-// TIM2 OUTPUT COMPARE CALLBACK — CH1
-// Fires every 20ms → generates 10us TRIG pulse
+// TIM2 OC CALLBACK — CH1 triggers sensors 1 & 2 simultaneously
+// TIM3 OC CALLBACK — CH1 triggers sensors 3 & 4 simultaneously
 // ============================================================
 void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim) {
-	if (htim->Instance != TIM2)
-		return;
 
-	if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
-		static uint8_t trigState = 0;
-
-		if (trigState == 0) {
-			HAL_GPIO_WritePin(TRIG_PORT, TRIG_PIN, GPIO_PIN_SET);
-			trigState = 1;
-
+	if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
+		static uint8_t trigState2 = 0;
+		if (trigState2 == 0) {
+			HAL_GPIO_WritePin(TRIG1_PORT, TRIG1_PIN, GPIO_PIN_SET);
+			HAL_GPIO_WritePin(TRIG2_PORT, TRIG2_PIN, GPIO_PIN_SET);
+			trigState2 = 1;
 			uint32_t nextCCR = __HAL_TIM_GET_COUNTER(htim) + TRIG_PULSE_US;
 			__HAL_TIM_SET_COMPARE(htim, TIM_CHANNEL_1, nextCCR);
-
 		} else {
-			HAL_GPIO_WritePin(TRIG_PORT, TRIG_PIN, GPIO_PIN_RESET);
-			trigState = 0;
-
+			HAL_GPIO_WritePin(TRIG1_PORT, TRIG1_PIN, GPIO_PIN_RESET);
+			HAL_GPIO_WritePin(TRIG2_PORT, TRIG2_PIN, GPIO_PIN_RESET);
+			trigState2 = 0;
 			uint32_t nextCCR = __HAL_TIM_GET_COMPARE(htim,
 					TIM_CHANNEL_1) + SONAR_PERIOD_US;
 			__HAL_TIM_SET_COMPARE(htim, TIM_CHANNEL_1, nextCCR);
+		}
+	}
 
-			if (capState == 0)
-				capState = 0;
+	if (htim->Instance == TIM3 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
+		static uint8_t trigState3 = 0;
+		if (trigState3 == 0) {
+			HAL_GPIO_WritePin(TRIG3_PORT, TRIG3_PIN, GPIO_PIN_SET);
+			HAL_GPIO_WritePin(TRIG4_PORT, TRIG4_PIN, GPIO_PIN_SET);
+			trigState3 = 1;
+			uint32_t nextCCR = __HAL_TIM_GET_COUNTER(htim) + TRIG_PULSE_US;
+			__HAL_TIM_SET_COMPARE(htim, TIM_CHANNEL_1, nextCCR);
+		} else {
+			HAL_GPIO_WritePin(TRIG3_PORT, TRIG3_PIN, GPIO_PIN_RESET);
+			HAL_GPIO_WritePin(TRIG4_PORT, TRIG4_PIN, GPIO_PIN_RESET);
+			trigState3 = 0;
+			uint32_t nextCCR = __HAL_TIM_GET_COMPARE(htim,
+					TIM_CHANNEL_1) + SONAR_PERIOD_US;
+			__HAL_TIM_SET_COMPARE(htim, TIM_CHANNEL_1, nextCCR);
 		}
 	}
 }
 
 // ============================================================
-// TIM2 INPUT CAPTURE CALLBACK — CH3
-// Rising  → t_start
-// Falling → t_end → notify ultrasonicTask
+// IC CALLBACKS
+// TIM2 CH3 = Front, TIM2 CH2 = Right
+// TIM3 CH3 = Left,  TIM3 CH4 = Rear
 // ============================================================
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
-	if (htim->Instance != TIM2)
-		return;
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-	if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_3) {
-		if (capState == 0) {
-			echoStart = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
+	// Sensor 1 Front — TIM2 CH3
+	if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_3) {
+		if (cap1State == 0) {
+			echo1Start = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
 			__HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_3,
 					TIM_INPUTCHANNELPOLARITY_FALLING);
-			capState = 1;
+			cap1State = 1;
 		} else {
-			echoEnd = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
+			echo1End = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
 			__HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_3,
 					TIM_INPUTCHANNELPOLARITY_RISING);
-			capState = 0;
-
-			BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-			vTaskNotifyGiveFromISR(ultrasonicHandle, &xHigherPriorityTaskWoken);
-			portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+			cap1State = 0;
+			vTaskNotifyGiveFromISR(sonarHandle[0], &xHigherPriorityTaskWoken);
 		}
 	}
+
+	// Sensor 2 Right — TIM2 CH2
+	if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
+		if (cap2State == 0) {
+			echo2Start = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+			__HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_2,
+					TIM_INPUTCHANNELPOLARITY_FALLING);
+			cap2State = 1;
+		} else {
+			echo2End = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+			__HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_2,
+					TIM_INPUTCHANNELPOLARITY_RISING);
+			cap2State = 0;
+			vTaskNotifyGiveFromISR(sonarHandle[1], &xHigherPriorityTaskWoken);
+		}
+	}
+
+	// Sensor 3 Left — TIM3 CH3
+	if (htim->Instance == TIM3 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_3) {
+		if (cap3State == 0) {
+			echo3Start = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
+			__HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_3,
+					TIM_INPUTCHANNELPOLARITY_FALLING);
+			cap3State = 1;
+		} else {
+			echo3End = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
+			__HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_3,
+					TIM_INPUTCHANNELPOLARITY_RISING);
+			cap3State = 0;
+			vTaskNotifyGiveFromISR(sonarHandle[2], &xHigherPriorityTaskWoken);
+		}
+	}
+
+	// Sensor 4 Rear — TIM3 CH4
+	if (htim->Instance == TIM3 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_4) {
+		if (cap4State == 0) {
+			echo4Start = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_4);
+			__HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_4,
+					TIM_INPUTCHANNELPOLARITY_FALLING);
+			cap4State = 1;
+		} else {
+			echo4End = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_4);
+			__HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_4,
+					TIM_INPUTCHANNELPOLARITY_RISING);
+			cap4State = 0;
+			vTaskNotifyGiveFromISR(sonarHandle[3], &xHigherPriorityTaskWoken);
+		}
+	}
+
+	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 // ============================================================
-// TASK 1: ULTRASONIC SCAN TASK
-// Woken by TIM2 IC ISR → computes distance → posts to obstacleQueue
+// HELPER: compute distance
+// TIM2 = 32-bit, TIM3 = 16-bit
 // ============================================================
-static void ultrasonicTask(void *arg) {
+static float computeDist(uint32_t start, uint32_t end, uint8_t is16bit) {
+	uint32_t pulseWidth;
+	if (end >= start) {
+		pulseWidth = end - start;
+	} else {
+		uint32_t wrap = is16bit ? 0xFFFFU : 0xFFFFFFFFU;
+		pulseWidth = (wrap - start) + end + 1U;
+	}
+	if (pulseWidth == 0 || pulseWidth > ECHO_TIMEOUT_US)
+		return 999.0f;
+	return (float) pulseWidth / US_TO_CM;
+}
+
+// ============================================================
+// TASK 1-4: SONAR TASKS
+// ============================================================
+static void sonarTask1(void *arg) {
 	(void) arg;
 	vTaskDelay(pdMS_TO_TICKS(200));
-	PRINT("[MCU3] Ultrasonic Scan Task started\r\n");
-
+	PRINT("[MCU3] sonarTask1 Front started\r\n");
 	for (;;) {
-		// Block until TIM2 IC falling edge ISR notifies
 		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		float dist = computeDist(echo1Start, echo1End, 0);
+		xQueueOverwrite(obstacleQueue[0], &dist);
+	}
+}
 
-		uint32_t start = echoStart;
-		uint32_t end = echoEnd;
+static void sonarTask2(void *arg) {
+	(void) arg;
+	vTaskDelay(pdMS_TO_TICKS(200));
+	PRINT("[MCU3] sonarTask2 Right started\r\n");
+	for (;;) {
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		float dist = computeDist(echo2Start, echo2End, 0);
+		xQueueOverwrite(obstacleQueue[1], &dist);
+	}
+}
 
-		uint32_t pulseWidth;
-		if (end >= start) {
-			pulseWidth = end - start;
-		} else {
-			pulseWidth = (0xFFFFFFFF - start) + end + 1;
-		}
+static void sonarTask3(void *arg) {
+	(void) arg;
+	vTaskDelay(pdMS_TO_TICKS(200));
+	PRINT("[MCU3] sonarTask3 Left started\r\n");
+	for (;;) {
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		float dist = computeDist(echo3Start, echo3End, 1);
+		xQueueOverwrite(obstacleQueue[2], &dist);
+	}
+}
 
-		float dist;
-		if (pulseWidth == 0 || pulseWidth > ECHO_TIMEOUT_US) {
-			dist = 999.0f;  // out of range
-		} else {
-			dist = (float) pulseWidth / US_TO_CM;
-		}
-
-		// Post to obstacleQueue — overwrites old value if not consumed yet
-		// use xQueueOverwrite for single-slot queue (always fresh data)
-		xQueueOverwrite(obstacleQueue, &dist);
+static void sonarTask4(void *arg) {
+	(void) arg;
+	vTaskDelay(pdMS_TO_TICKS(200));
+	PRINT("[MCU3] sonarTask4 Rear started\r\n");
+	for (;;) {
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		float dist = computeDist(echo4Start, echo4End, 1);
+		xQueueOverwrite(obstacleQueue[3], &dist);
 	}
 }
 
 // ============================================================
-// TASK 2: OBSTACLE ANALYSIS TASK
-// Blocks on obstacleQueue → evaluates distance → sets event group
-// or pushes PATH_CLEAR to canTxQueue
+// TASK 5: OBSTACLE ANALYSIS
 // ============================================================
 static void obstacleAnalysisTask(void *arg) {
 	(void) arg;
 	vTaskDelay(pdMS_TO_TICKS(300));
 	PRINT("[MCU3] Obstacle Analysis Task started\r\n");
 
-	float dist;
 	static uint8_t wasEmergency = 0;
+	float dist[4] = { 999.0f, 999.0f, 999.0f, 999.0f };
+	const char *name[4] = { "Right", "Left", "Front", "Rear" };
 
 	for (;;) {
-		// Block until ultrasonicTask posts a fresh distance
-		xQueueReceive(obstacleQueue, &dist, portMAX_DELAY);
+		xQueueReceive(obstacleQueue[0], &dist[0], portMAX_DELAY);
+		xQueueReceive(obstacleQueue[1], &dist[1], 0);
+		xQueueReceive(obstacleQueue[2], &dist[2], 0);
+		xQueueReceive(obstacleQueue[3], &dist[3], 0);
 
-		PRINT("[sonar] Distance: %.1f cm\r\n", dist);
+		PRINT("[sonar] F:%.1f R:%.1f L:%.1f B:%.1f cm\r\n", dist[0], dist[1],
+				dist[2], dist[3]);
 
-		if (dist < OBSTACLE_THRESHOLD_CM && !wasEmergency) {
-			// Transition to EMERGENCY
+		uint8_t anyObstacle = 0;
+		for (int i = 0; i < 4; i++) {
+			if (dist[i] < OBSTACLE_THRESHOLD_CM) {
+				anyObstacle = 1;
+				PRINT("[MCU3] Obstacle %s: %.1f cm\r\n", name[i], dist[i]);
+			}
+		}
+
+		if (anyObstacle && !wasEmergency) {
 			wasEmergency = 1;
-
-			// Set emergency stop bit — wakes Emergency Stop Task immediately
 			xEventGroupSetBits(threatEventGroup, EMERGENCY_STOP_BIT);
 			PRINT("[MCU3] Obstacle! Setting EMERGENCY_STOP_BIT\r\n");
 
-		} else if (dist >= OBSTACLE_THRESHOLD_CM && wasEmergency) {
-			// Transition back to CLEAR
+		} else if (!anyObstacle && wasEmergency) {
 			wasEmergency = 0;
-
-			// Release stopActiveSem so next emergency can send 0x302 again
 			xSemaphoreGive(stopActiveSem);
 
-			// Push PATH_CLEAR frame to CAN Transmit Task queue
 			CAN_MsgTypeDef msg = { 0 };
 			msg.id = CAN_ID_PATH_CLEAR;
 			msg.data[0] = 0xC1;
@@ -236,29 +358,23 @@ static void obstacleAnalysisTask(void *arg) {
 }
 
 // ============================================================
-// TASK 3: EMERGENCY STOP TASK — highest priority on MCU3
-// Blocks on event group bit → sends 0x302 DIRECTLY to FDCAN
-// bypassing canTxQueue for zero delay
+// TASK 6: EMERGENCY STOP — highest priority
 // ============================================================
 static void emergencyStopTask(void *arg) {
 	(void) arg;
 
 	for (;;) {
-		// Block permanently until EMERGENCY_STOP_BIT is set
+		PRINT("[MCU3] emergTask: attempting 0x302 TX\r\n");
+
 		xEventGroupWaitBits(threatEventGroup,
 		EMERGENCY_STOP_BIT,
-		pdTRUE,         // clear bit on exit
-				pdFALSE,        // wait for any bit (only 1 bit here)
-				portMAX_DELAY);
+		pdTRUE, pdFALSE, portMAX_DELAY);
 
-		// Check if a stop is already in flight — suppress duplicate
 		if (xSemaphoreTake(stopActiveSem, 0) != pdTRUE) {
-			// Semaphore already taken — stop already sent, skip
 			PRINT("[MCU3] Stop already active, suppressing duplicate\r\n");
 			continue;
 		}
 
-		// Write 0x302 DIRECTLY to FDCAN TX Mailbox — bypass all queues
 		FDCAN_TxHeaderTypeDef txHeader = { 0 };
 		txHeader.Identifier = CAN_ID_EMERGENCY_STOP;
 		txHeader.IdType = FDCAN_STANDARD_ID;
@@ -277,11 +393,9 @@ static void emergencyStopTask(void *arg) {
 		} else {
 			PRINT("[MCU3] EMERGENCY_STOP TX FAILED! Err=%lu\r\n",
 					hfdcan1.ErrorCode);
-			// Release semaphore so next attempt can try
 			xSemaphoreGive(stopActiveSem);
 		}
 
-		// Also alert MCU1 via normal queue
 		CAN_MsgTypeDef alertMsg = { 0 };
 		alertMsg.id = CAN_ID_OBSTACLE_ALERT;
 		alertMsg.data[0] = 0xA1;
@@ -290,18 +404,14 @@ static void emergencyStopTask(void *arg) {
 }
 
 // ============================================================
-// TASK 4: CAN TRANSMIT TASK
-// Blocks on canTxQueue → sends via Mailbox 0/1
-// Never uses Mailbox 2 — reserved for Emergency Stop Task
+// TASK 7: CAN TX
 // ============================================================
 static void canTxTask(void *arg) {
 	(void) arg;
 	PRINT("[MCU3] CAN Transmit Task started\r\n");
 
 	CAN_MsgTypeDef msg;
-
 	for (;;) {
-		// Block until a frame is queued
 		xQueueReceive(canTxQueue, &msg, portMAX_DELAY);
 
 		FDCAN_TxHeaderTypeDef txHeader = { 0 };
@@ -315,7 +425,6 @@ static void canTxTask(void *arg) {
 		txHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
 		txHeader.MessageMarker = 0;
 
-		// Wait for mailbox to be free
 		xSemaphoreTake(canTxMailboxSem, portMAX_DELAY);
 
 		if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txHeader, msg.data)
@@ -324,14 +433,13 @@ static void canTxTask(void *arg) {
 		} else {
 			PRINT("[MCU3] CAN TX FAILED id=0x%03lX err=%lu\r\n", msg.id,
 					hfdcan1.ErrorCode);
-			// Give back semaphore since TX didn't actually use mailbox
 			xSemaphoreGive(canTxMailboxSem);
 		}
 	}
 }
 
 // ============================================================
-// TASK 5: BLINK TASK
+// TASK 8: LED BLINK
 // ============================================================
 static void gpioTask(void *arg) {
 	(void) arg;
@@ -353,35 +461,46 @@ int main(void) {
 	SystemClock_Config();
 	MX_GPIO_Init();
 	MX_TIM2_Init();
+	MX_TIM3_Init();
 	MX_FDCAN1_Init();
 
-	// FDCAN setup ...
 	if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
 		Error_Handler();
 	HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_TX_FIFO_EMPTY, 0);
 
-	// TIM2 start
+	// TIM2 — sensors 1 (Front) & 2 (Right)
 	HAL_TIM_Base_Start(&htim2);
 	HAL_TIM_OC_Start_IT(&htim2, TIM_CHANNEL_1);
+	HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_2);
 	HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_3);
 
-	// ← Create mutex FIRST before any PRINT
+	// TIM3 — sensors 3 (Left) & 4 (Rear)
+	HAL_TIM_Base_Start(&htim3);
+	HAL_TIM_OC_Start_IT(&htim3, TIM_CHANNEL_1);
+	HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_3);
+	HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_4);
+
 	printMutex = xSemaphoreCreateMutex();
 	stopActiveSem = xSemaphoreCreateBinary();
 	canTxMailboxSem = xSemaphoreCreateBinary();
 	threatEventGroup = xEventGroupCreate();
-	obstacleQueue = xQueueCreate(1, sizeof(float));
+
+	for (int i = 0; i < 4; i++) {
+		obstacleQueue[i] = xQueueCreate(1, sizeof(float));
+	}
 	canTxQueue = xQueueCreate(8, sizeof(CAN_MsgTypeDef));
 
 	xSemaphoreGive(stopActiveSem);
 	xSemaphoreGive(canTxMailboxSem);
 
-	// NOW safe to use printf directly (before scheduler)
 	printf("[MCU3] System init OK\r\n");
 
 	xTaskCreate(gpioTask, "gpioTask", 128, NULL, 1, NULL);
-	xTaskCreate(ultrasonicTask, "sonarTask", 256, NULL, 2, &ultrasonicHandle);
-	xTaskCreate(obstacleAnalysisTask, "obsTask", 256, NULL, 3, NULL);
+	xTaskCreate(sonarTask1, "sonar1", 256, NULL, 2, &sonarHandle[0]);
+	xTaskCreate(sonarTask2, "sonar2", 256, NULL, 2, &sonarHandle[1]);
+	xTaskCreate(sonarTask3, "sonar3", 256, NULL, 2, &sonarHandle[2]);
+	xTaskCreate(sonarTask4, "sonar4", 256, NULL, 2, &sonarHandle[3]);
+	xTaskCreate(obstacleAnalysisTask, "obsTask", 384, NULL, 3, NULL);
 	xTaskCreate(canTxTask, "canTxTask", 256, NULL, 3, NULL);
 	xTaskCreate(emergencyStopTask, "emergTask", 256, NULL, 5, NULL);
 
@@ -417,7 +536,7 @@ static void MX_FDCAN1_Init(void) {
 }
 
 // ============================================================
-// TIM2 INIT
+// TIM2 INIT — 1MHz, OC CH1 trigger, IC CH2+CH3 echo
 // ============================================================
 static void MX_TIM2_Init(void) {
 	__HAL_RCC_TIM2_CLK_ENABLE();
@@ -444,11 +563,50 @@ static void MX_TIM2_Init(void) {
 	sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
 	sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
 	sConfigIC.ICFilter = 0x0F;
+	if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
+		Error_Handler();
 	if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_3) != HAL_OK)
 		Error_Handler();
 
 	HAL_NVIC_SetPriority(TIM2_IRQn, 6, 0);
 	HAL_NVIC_EnableIRQ(TIM2_IRQn);
+}
+
+// ============================================================
+// TIM3 INIT — 1MHz, OC CH1 trigger, IC CH3+CH4 echo
+// ============================================================
+static void MX_TIM3_Init(void) {
+	__HAL_RCC_TIM3_CLK_ENABLE();
+
+	htim3.Instance = TIM3;
+	htim3.Init.Prescaler = 250 - 1;
+	htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim3.Init.Period = 0xFFFF;
+	htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+	if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+		Error_Handler();
+
+	TIM_OC_InitTypeDef sConfigOC = { 0 };
+	sConfigOC.OCMode = TIM_OCMODE_TIMING;
+	sConfigOC.Pulse = SONAR_PERIOD_US;
+	sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+	sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+	if (HAL_TIM_OC_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+		Error_Handler();
+
+	TIM_IC_InitTypeDef sConfigIC = { 0 };
+	sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+	sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+	sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+	sConfigIC.ICFilter = 0x0F;
+	if (HAL_TIM_IC_ConfigChannel(&htim3, &sConfigIC, TIM_CHANNEL_3) != HAL_OK)
+		Error_Handler();
+	if (HAL_TIM_IC_ConfigChannel(&htim3, &sConfigIC, TIM_CHANNEL_4) != HAL_OK)
+		Error_Handler();
+
+	HAL_NVIC_SetPriority(TIM3_IRQn, 6, 0);
+	HAL_NVIC_EnableIRQ(TIM3_IRQn);
 }
 
 // ============================================================
@@ -461,7 +619,7 @@ static void MX_GPIO_Init(void) {
 	__HAL_RCC_GPIOB_CLK_ENABLE();
 	__HAL_RCC_GPIOC_CLK_ENABLE();
 
-	// PC13 - LED
+	// PC13 — LED
 	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
 	GPIO_InitStruct.Pin = GPIO_PIN_13;
 	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -469,23 +627,48 @@ static void MX_GPIO_Init(void) {
 	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
 	HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-	// PA6 - TRIG
-	HAL_GPIO_WritePin(TRIG_PORT, TRIG_PIN, GPIO_PIN_RESET);
-	GPIO_InitStruct.Pin = TRIG_PIN;
+	// PA4=TRIG2 PA5=TRIG3 PA6=TRIG1 — GPIO outputs
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6,
+			GPIO_PIN_RESET);
+	GPIO_InitStruct.Pin = GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6;
 	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
 	GPIO_InitStruct.Pull = GPIO_NOPULL;
 	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-	HAL_GPIO_Init(TRIG_PORT, &GPIO_InitStruct);
+	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-	// PA7 - ECHO TIM2 CH3 AF1
-	GPIO_InitStruct.Pin = GPIO_PIN_7;
+	// PA1 — TIM2 CH2 ECHO2 Right, AF1
+	GPIO_InitStruct.Pin = GPIO_PIN_1;
 	GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
 	GPIO_InitStruct.Pull = GPIO_NOPULL;
 	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
 	GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
 	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-	// PB10 - FDCAN1 TX AF9
+	// PA7 — TIM2 CH3 ECHO1 Front, AF1
+	GPIO_InitStruct.Pin = GPIO_PIN_7;
+	GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
+	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+	// PB0 — TIM3 CH3 ECHO3 Left, AF2
+	GPIO_InitStruct.Pin = GPIO_PIN_0;
+	GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
+	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+	// PB1 — TIM3 CH4 ECHO4 Rear, AF2
+	GPIO_InitStruct.Pin = GPIO_PIN_1;
+	GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
+	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+	// PB8 — TRIG4 Rear, GPIO output
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+	GPIO_InitStruct.Pin = GPIO_PIN_8;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+	GPIO_InitStruct.Alternate = 0;
+	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+	// PB10 — FDCAN1 TX, AF9
 	GPIO_InitStruct.Pin = GPIO_PIN_10;
 	GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
 	GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -493,11 +676,9 @@ static void MX_GPIO_Init(void) {
 	GPIO_InitStruct.Alternate = GPIO_AF9_FDCAN1;
 	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-	// PB12 - FDCAN1 RX AF9
+	// PB12 — FDCAN1 RX, AF9
 	GPIO_InitStruct.Pin = GPIO_PIN_12;
-	GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
 	GPIO_InitStruct.Pull = GPIO_PULLUP;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
 	GPIO_InitStruct.Alternate = GPIO_AF9_FDCAN1;
 	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }

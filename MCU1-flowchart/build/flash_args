@@ -1,0 +1,5 @@
+--flash-mode dio --flash-freq 40m --flash-size 4MB
+0x1000 bootloader/bootloader.bin
+0xc000 partition_table/partition-table.bin
+0x1e000 ota_data_initial.bin
+0x30000 switch.bin

@@ -1,0 +1,16 @@
+Command: ninja all
+Configuration Report                                                            
+ ────────────────────────────────────────────────────────────────────────────── 
+   Parser Version: 1                                                            
+   Verbosity: default                                                           
+   Defaults policy: sdkconfig                                                   
+   Status: Finished with notifications                                          
+                                                                                
+  Disabled Symbols/Choices With User-Set Value                                  
+   ──────────────────────────────────────────────────────────────────────────   
+    * ESP_CONSOLE_UART_BAUDRATE (defined at                                     
+    /home/thevien257/.espressif/v6.0/esp-idf/components/esp_stdio/Kconfig:1…    
+    with user-set value 115200 from                                             
+    /home/thevien257/tmp/kconfgen_tmpw9xklfd2                                   
+   ──────────────────────────────────────────────────────────────────────────   
+ ────────────────────────────────────────────────────────────────────────────── 

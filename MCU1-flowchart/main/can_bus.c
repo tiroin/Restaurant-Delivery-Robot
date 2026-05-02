@@ -139,7 +139,7 @@ void can_tx_task(void *pvParam)
                                       pdMS_TO_TICKS(CAN_TX_ENQUEUE_TIMEOUT_MS));
         if (err == ESP_OK) {
             ESP_LOGD(TAG, "Tx → id=0x%03lX  len=%d  data[0]=0x%02X",
-                     frame.identifier,
+                     frame.identifier, 
                      frame.data_length_code,
                      frame.data_length_code > 0 ? frame.data[0] : 0);
         } else {

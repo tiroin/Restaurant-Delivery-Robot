@@ -1,0 +1,9 @@
+../Core/Src/testCan.c:47:23:dlc_to_bytes	1
+../Core/Src/testCan.c:54:6:HAL_FDCAN_RxFifo0Callback	4
+../Core/Src/testCan.c:78:13:canTxTask	2
+../Core/Src/testCan.c:112:13:canRxTask	4
+../Core/Src/testCan.c:131:13:MX_FDCAN1_Init	2
+../Core/Src/testCan.c:158:13:MX_GPIO_Init	1
+../Core/Src/testCan.c:178:5:main	4
+../Core/Src/testCan.c:225:6:SystemClock_Config	4
+../Core/Src/testCan.c:263:6:Error_Handler	1

@@ -1,0 +1,44 @@
+Command: ninja all
+[1/9] Performing build step for 'bootloader'
+[1/1] cd /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/build/bootloader && /home/thevien257/.espressif/python_env/idf6.0_py3.12_env/bin/python /home/thevien257/.espressif/v6.0/esp-idf/components/partition_table/check_sizes.py --offset 0xc000 bootloader 0x1000 /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/build/bootloader/bootloader.bin
+Bootloader binary size 0x6660 bytes. 0x49a0 bytes (42%) free.
+[2/9] No install step for 'bootloader'
+[3/9] Completed 'bootloader'
+[4/9] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/app_main.c.obj
+In file included from /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/main/app_main.c:19:
+/home/thevien257/.espressif/v6.0/esp-idf/components/driver/twai/include/driver/twai.h:17:2: warning: #warning "The legacy TWAI driver is deprecated, please use esp_twai.h" [-Wcpp]
+   17 | #warning "The legacy TWAI driver is deprecated, please use esp_twai.h"
+      |  ^~~~~~~
+In file included from /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/managed_components/mkfrey__u8g2-hal-esp-idf/include/u8g2_esp32_hal.h:15,
+                 from /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/main/app_main.c:22:
+/home/thevien257/.espressif/v6.0/esp-idf/components/driver/i2c/include/driver/i2c.h:13:9: note: '#pragma message: 
+================================ CRITICAL WARNING ================================
+This legacy I2C driver (driver/i2c.h) is officially END-OF-LIFE (EOL) as of ESP-IDF v6.0.
+
+1. NO SUPPORT: ESP-IDF will not provide updates, bug fixes, or security patches timely.
+2. PLANNED REMOVAL: This driver WILL BE REMOVED in ESP-IDF v7.0 (next major release).
+3. ACTION REQUIRED: Migrate to 'driver/i2c_master.h' or 'driver/i2c_slave.h' immediately.
+   - If you are a library maintainer, please update your code.
+   - If you are using 3rd-party libraries, contact the authors for updates.
+
+4. SUPPRESS WARNING: Set Kconfig 'CONFIG_I2C_SUPPRESS_DEPRECATE_WARN=y' to silent
+   this warning. However, by doing so, YOU ASSUME ALL RISKS including potential
+   security vulnerabilities, system instability, and future incompatibility.
+
+For API reference of the new I2C driver, see: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/i2c.html
+For other items about migration, see: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/migration-guides/index.html
+==================================================================================
+   '
+   13 | #pragma message("\n" \
+      |         ^~~~~~~
+[5/9] Linking C static library esp-idf/main/libmain.a
+[6/9] Generating esp-idf/esp_system/ld/sections.ld
+[7/9] Linking CXX executable switch.elf
+[8/9] Generating binary image from built executable
+esptool v5.3.dev2
+Creating ESP32 image...
+Merged 2 ELF sections.
+Successfully created ESP32 image.
+Generated /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/build/switch.bin
+[9/9] cd /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/build && /home/thevien257/.espressif/python_env/idf6.0_py3.12_env/bin/python /home/thevien257/.espressif/v6.0/esp-idf/components/partition_table/check_sizes.py --offset 0xc000 partition --type app /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/build/partition_table/partition-table.bin /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/build/switch.bin
+switch.bin binary size 0x31070 bytes. Smallest app partition is 0x180000 bytes. 0x14ef90 bytes (87%) free.

@@ -1,0 +1,9 @@
+../Core/Src/testCan.c:47:23:dlc_to_bytes	16	static
+../Core/Src/testCan.c:54:6:HAL_FDCAN_RxFifo0Callback	80	static
+../Core/Src/testCan.c:78:13:canTxTask	64	static
+../Core/Src/testCan.c:112:13:canRxTask	40	static
+../Core/Src/testCan.c:131:13:MX_FDCAN1_Init	8	static
+../Core/Src/testCan.c:158:13:MX_GPIO_Init	32	static
+../Core/Src/testCan.c:178:5:main	40	static
+../Core/Src/testCan.c:225:6:SystemClock_Config	120	static
+../Core/Src/testCan.c:263:6:Error_Handler	4	static,ignoring_inline_asm
