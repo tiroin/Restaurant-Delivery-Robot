@@ -28,6 +28,16 @@ CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=3120
 # For additional security on reset to factory
 CONFIG_ESP_RMAKER_USER_ID_CHECK=y
 
+# ── WebSocket + HTTP Server for joystick UI ──────────────────
+# Enable WebSocket support in esp_http_server
+CONFIG_HTTPD_WS_SUPPORT=y
+# Increase max open sockets to handle WS + HTTP simultaneously
+CONFIG_LWIP_MAX_SOCKETS=16
+# Larger HTTP header buffer for WS upgrade handshake
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+# Allow HTTP server to handle WS frames up to 4KB
+CONFIG_HTTPD_MAX_URI_LEN=512
+
 # Enable parameter console commands
 CONFIG_ESP_RMAKER_CONSOLE_PARAM_CMDS_ENABLE=y
 

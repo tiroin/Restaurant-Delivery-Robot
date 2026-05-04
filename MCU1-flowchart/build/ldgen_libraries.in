@@ -202,4 +202,5 @@ $<TARGET_FILE:__idf_driver>
 $<TARGET_FILE:idf::mkfrey__u8g2-hal-esp-idf>
 $<TARGET_FILE:__idf_nixy4__u8g2>
 $<TARGET_FILE:idf::main>
+$<TARGET_FILE:__idf_esp_driver_twai>
 $<TARGET_FILE:__idf_mkfrey__u8g2-hal-esp-idf>

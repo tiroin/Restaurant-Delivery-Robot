@@ -35242,14 +35242,14 @@
                         ],
                         "depends_on": null,
                         "help": "Select which u8g2 display driver family to compile.\nDefault is ALL for backward compatibility.",
-                        "id": "component-config-u8g2-configuration-u8g2-display-driver-family-home-thevien257-Desktop-term-Embedded-Restaurant-Delivery-Robot-MCU1-flowchart-managed_components-nixy4__u8g2-Kconfig-3",
+                        "id": "component-config-u8g2-configuration-u8g2-display-driver-family-home-thevien257-Desktop-term-Embedded-Restaurant-Delivery-Robot-MCU1-flowchart-components-nixy4__u8g2-Kconfig-3",
                         "name": "U8G2_DISPLAY_DRIVER_CHIP",
                         "title": "u8g2 display driver family",
                         "type": "choice"
                     }
                 ],
                 "depends_on": null,
-                "id": "component-config-u8g2-configuration-home-thevien257-Desktop-term-Embedded-Restaurant-Delivery-Robot-MCU1-flowchart-managed_components-nixy4__u8g2-Kconfig-1",
+                "id": "component-config-u8g2-configuration-home-thevien257-Desktop-term-Embedded-Restaurant-Delivery-Robot-MCU1-flowchart-components-nixy4__u8g2-Kconfig-1",
                 "title": "u8g2 Configuration",
                 "type": "menu"
             },

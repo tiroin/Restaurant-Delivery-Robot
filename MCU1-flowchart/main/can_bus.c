@@ -62,7 +62,7 @@ esp_err_t can_bus_init(void)
     g_cfg.rx_queue_len = 32;
     g_cfg.tx_queue_len = 16;
 
-    twai_timing_config_t  t_cfg = TWAI_TIMING_CONFIG_500KBITS();
+    twai_timing_config_t  t_cfg = TWAI_TIMING_CONFIG_1MBITS();
     twai_filter_config_t  f_cfg = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     esp_err_t err = twai_driver_install(&g_cfg, &t_cfg, &f_cfg);
@@ -77,7 +77,7 @@ esp_err_t can_bus_init(void)
         return err;
     }
 
-    ESP_LOGI(TAG, "TWAI started — TX:GPIO%d  RX:GPIO%d  @500kbps",
+    ESP_LOGI(TAG, "TWAI started — TX:GPIO%d  RX:GPIO%d  @1Mbps",
              CONFIG_CAN_TX_GPIO, CONFIG_CAN_RX_GPIO);
     return ESP_OK;
 }

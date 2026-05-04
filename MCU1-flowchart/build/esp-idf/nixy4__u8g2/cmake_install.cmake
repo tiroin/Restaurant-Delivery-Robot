@@ -1,4 +1,4 @@
-# Install script for directory: /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/managed_components/nixy4__u8g2
+# Install script for directory: /home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/components/nixy4__u8g2
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)

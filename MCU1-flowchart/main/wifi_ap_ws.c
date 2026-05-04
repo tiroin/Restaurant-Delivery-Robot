@@ -1,0 +1,313 @@
+/**
+ * @file    wifi_ap_ws.c
+ * @brief   WiFi SoftAP + HTTP/WebSocket server — Implementation
+ *
+ *  Incoming WS JSON commands are translated into TWAI frames and transmitted
+ *  immediately (non-blocking). Outgoing telemetry JSON is pushed by the
+ *  caller via wifi_ap_ws_broadcast().
+ */
+
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include "esp_log.h"
+#include "esp_check.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
+#include "driver/twai.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "wifi_ap_ws.h"
+#include "robot_types.h"
+
+static const char *TAG = "WSAP";
+
+/* ── AP credentials ─────────────────────────── */
+#define AP_SSID         "RobotControl"
+#define AP_PASS         "robot1234"
+#define AP_CHANNEL      6
+#define AP_MAX_CONN     4
+
+/* ── Embedded HTML (index.html, registered in CMakeLists.txt) ── */
+extern const uint8_t index_html_start[] asm("_binary_index_html_start");
+extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
+
+/* ── HTTP server handle ──────────────────────── */
+static httpd_handle_t s_server = NULL;
+
+/* ══════════════════════════════════════════════
+ *  Helper — build and transmit a TWAI frame
+ * ══════════════════════════════════════════════ */
+static void can_tx(uint32_t id, const uint8_t *data, uint8_t len)
+{
+    twai_message_t frame = {
+        .identifier       = id,
+        .data_length_code = len,
+    };
+    if (len > 0 && data) {
+        memcpy(frame.data, data, len);
+    }
+    esp_err_t err = twai_transmit(&frame, pdMS_TO_TICKS(10));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "twai_transmit 0x%03" PRIx32 ": %s",
+                 id, esp_err_to_name(err));
+    }
+}
+
+/* ══════════════════════════════════════════════
+ *  Minimal JSON field extractor (no external deps)
+ *  Finds  "key":value  and returns integer value.
+ *  Returns def if key not found or not numeric.
+ * ══════════════════════════════════════════════ */
+static int json_get_int(const char *json, const char *key, int def)
+{
+    /* Build search pattern  "key":  */
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(json, pat);
+    if (!p) return def;
+    p += strlen(pat);
+    /* Skip whitespace */
+    while (*p == ' ' || *p == '\t') p++;
+    int v = def;
+    sscanf(p, "%d", &v);
+    return v;
+}
+
+static int json_get_str(const char *json, const char *key,
+                        char *out, size_t out_len)
+{
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return 0;
+    p += strlen(pat);
+    size_t i = 0;
+    while (*p && *p != '"' && i < out_len - 1) out[i++] = *p++;
+    out[i] = '\0';
+    return (int)i;
+}
+
+/* ══════════════════════════════════════════════
+ *  WS message parser → CAN TX
+ * ══════════════════════════════════════════════ */
+static void handle_ws_message(const char *msg)
+{
+    char cmd[24] = {0};
+    if (!json_get_str(msg, "cmd", cmd, sizeof(cmd))) return;
+
+    if (strcmp(cmd, "move") == 0) {
+        /* {"cmd":"move","dir":0-3,"steps":N,"speed":N} */
+        uint8_t  dir   = (uint8_t)json_get_int(msg, "dir",   0);
+        uint16_t steps = (uint16_t)json_get_int(msg, "steps", 0);
+        uint16_t speed = (uint16_t)json_get_int(msg, "speed", 500);
+
+        uint8_t data[5] = {
+            dir,
+            (uint8_t)(steps >> 8), (uint8_t)(steps & 0xFF),
+            (uint8_t)(speed >> 8), (uint8_t)(speed & 0xFF),
+        };
+        can_tx(CAN_ID_MANUAL_MOVE, data, sizeof(data));
+
+    } else if (strcmp(cmd, "stop") == 0) {
+        /* {"cmd":"stop"} */
+        uint8_t data[5] = {0};
+        can_tx(CAN_ID_MANUAL_MOVE, data, sizeof(data));
+
+    } else if (strcmp(cmd, "save_cp") == 0) {
+        /* {"cmd":"save_cp","id":0-15} */
+        uint8_t data[1] = { (uint8_t)json_get_int(msg, "id", 0) };
+        can_tx(CAN_ID_SAVE_CP, data, sizeof(data));
+
+    } else if (strcmp(cmd, "set_mode") == 0) {
+        /* {"cmd":"set_mode","mode":0-2} */
+        uint8_t data[1] = { (uint8_t)json_get_int(msg, "mode", 0) };
+        can_tx(CAN_ID_SET_MODE, data, sizeof(data));
+
+    } else {
+        ESP_LOGW(TAG, "Unknown WS cmd: %s", cmd);
+    }
+}
+
+/* ══════════════════════════════════════════════
+ *  HTTP GET / — serve embedded HTML page
+ * ══════════════════════════════════════════════ */
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+    size_t len = (size_t)(index_html_end - index_html_start);
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_send(req, (const char *)index_html_start, (ssize_t)len);
+    return ESP_OK;
+}
+
+/* ══════════════════════════════════════════════
+ *  WebSocket handler
+ * ══════════════════════════════════════════════ */
+static esp_err_t ws_handler(httpd_req_t *req)
+{
+    /* Upgrade handshake (HTTP GET that gets promoted to WS) */
+    if (req->method == HTTP_GET) {
+        ESP_LOGI(TAG, "WS client connected fd=%d",
+                 httpd_req_to_sockfd(req));
+        return ESP_OK;
+    }
+
+    /* Receive frame header first (len=0 gives us the frame metadata) */
+    httpd_ws_frame_t frame = {0};
+    esp_err_t ret = httpd_ws_recv_frame(req, &frame, 0);
+    if (ret != ESP_OK) return ret;
+
+    /* Ignore non-text frames (ping/pong/close handled by httpd internally) */
+    if (frame.type != HTTPD_WS_TYPE_TEXT || frame.len == 0) {
+        return ESP_OK;
+    }
+
+    /* Allocate buffer and receive payload */
+    uint8_t *buf = calloc(1, frame.len + 1);
+    if (!buf) return ESP_ERR_NO_MEM;
+
+    frame.payload = buf;
+    ret = httpd_ws_recv_frame(req, &frame, frame.len);
+    if (ret == ESP_OK) {
+        buf[frame.len] = '\0';
+        handle_ws_message((const char *)buf);
+    } else {
+        ESP_LOGW(TAG, "ws recv payload err: %s", esp_err_to_name(ret));
+    }
+
+    free(buf);
+    return ret;
+}
+
+/* ══════════════════════════════════════════════
+ *  Public API — broadcast to all WS clients
+ * ══════════════════════════════════════════════ */
+esp_err_t wifi_ap_ws_broadcast(const char *json_str)
+{
+    if (!s_server || !json_str) return ESP_FAIL;
+
+    /* Get current client count */
+    size_t n = 0;
+    esp_err_t err = httpd_get_client_list(s_server, &n, NULL);
+    if (err != ESP_OK || n == 0) return ESP_OK;
+
+    int *fds = malloc(n * sizeof(int));
+    if (!fds) return ESP_ERR_NO_MEM;
+
+    err = httpd_get_client_list(s_server, &n, fds);
+    if (err != ESP_OK) { free(fds); return err; }
+
+    httpd_ws_frame_t frame = {
+        .type    = HTTPD_WS_TYPE_TEXT,
+        .payload = (uint8_t *)json_str,
+        .len     = strlen(json_str),
+        .final   = true,
+    };
+
+    for (size_t i = 0; i < n; i++) {
+        if (httpd_ws_get_fd_info(s_server, fds[i]) ==
+                HTTPD_WS_CLIENT_WEBSOCKET) {
+            httpd_ws_send_frame_async(s_server, fds[i], &frame);
+        }
+    }
+
+    free(fds);
+    return ESP_OK;
+}
+
+/* ══════════════════════════════════════════════
+ *  Internal — start HTTP server
+ * ══════════════════════════════════════════════ */
+static esp_err_t start_webserver(void)
+{
+    httpd_config_t config   = HTTPD_DEFAULT_CONFIG();
+    config.max_open_sockets = 7;
+    config.stack_size       = 8192;
+    config.lru_purge_enable = true;
+
+    ESP_RETURN_ON_ERROR(httpd_start(&s_server, &config),
+                        TAG, "httpd_start failed");
+
+    static const httpd_uri_t root_uri = {
+        .uri     = "/",
+        .method  = HTTP_GET,
+        .handler = root_get_handler,
+    };
+    httpd_register_uri_handler(s_server, &root_uri);
+
+    static const httpd_uri_t ws_uri = {
+        .uri          = "/ws",
+        .method       = HTTP_GET,
+        .handler      = ws_handler,
+        .is_websocket = true,
+    };
+    httpd_register_uri_handler(s_server, &ws_uri);
+
+    ESP_LOGI(TAG, "HTTP server on :80  WS on /ws");
+    return ESP_OK;
+}
+
+/* ══════════════════════════════════════════════
+ *  WiFi event handler (logging only)
+ * ══════════════════════════════════════════════ */
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t id, void *data)
+{
+    if (base == WIFI_EVENT) {
+        if (id == WIFI_EVENT_AP_STACONNECTED) {
+            wifi_event_ap_staconnected_t *e =
+                (wifi_event_ap_staconnected_t *)data;
+            ESP_LOGI(TAG, "Client connected aid=%d", e->aid);
+        } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
+            wifi_event_ap_stadisconnected_t *e =
+                (wifi_event_ap_stadisconnected_t *)data;
+            ESP_LOGI(TAG, "Client disconnected aid=%d", e->aid);
+        }
+    }
+}
+
+/* ══════════════════════════════════════════════
+ *  Public API — init
+ * ══════════════════════════════════════════════ */
+esp_err_t wifi_ap_ws_init(void)
+{
+    /* Create default AP netif (provides DHCP server + lwIP AP interface) */
+    esp_netif_create_default_wifi_ap();
+
+    /* Init Wi-Fi driver */
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "esp_wifi_init failed");
+
+    /* Register event handler for connection logging */
+    ESP_RETURN_ON_ERROR(
+        esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                            wifi_event_handler, NULL, NULL),
+        TAG, "event_handler_register failed");
+
+    /* Configure AP */
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid           = AP_SSID,
+            .ssid_len       = (uint8_t)strlen(AP_SSID),
+            .password       = AP_PASS,
+            .channel        = AP_CHANNEL,
+            .max_connection = AP_MAX_CONN,
+            .authmode       = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP),
+                        TAG, "esp_wifi_set_mode failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg),
+                        TAG, "esp_wifi_set_config failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_start(),
+                        TAG, "esp_wifi_start failed");
+
+    ESP_LOGI(TAG, "WiFi AP ready — SSID:\"%s\"  Pass:\"%s\"  IP:192.168.4.1",
+             AP_SSID, AP_PASS);
+
+    return start_webserver();
+}

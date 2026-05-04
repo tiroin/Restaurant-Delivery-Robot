@@ -129,6 +129,69 @@ typedef struct {
 #define MOTION_STATUS_OBSTACLE  0x03U
 #define MOTION_STATUS_ERROR     0x04U
 
+/* ════════════════════════════════════════════════════════════════
+ *  TEACH-AND-REPLAY — Manual Learning Protocol
+ * ════════════════════════════════════════════════════════════════ */
+
+/* ── MCU1 (ESP32) → MCU2 (Motion MCU) ── */
+
+/** Manual move command.
+ *  data[0]   = dir  (0=FWD, 1=BWD, 2=LEFT, 3=RIGHT)
+ *  data[1:2] = steps uint16 big-endian  (0 = stop)
+ *  data[3:4] = speed uint16 big-endian  (TIM period µs; smaller = faster)
+ */
+#define CAN_ID_MANUAL_MOVE      0x110U
+
+/** Save current position as checkpoint.
+ *  data[0] = checkpoint_id (0=Home, 1..15=table slots)
+ */
+#define CAN_ID_SAVE_CP          0x111U
+
+/** Clear a saved checkpoint from flash.
+ *  data[0] = checkpoint_id
+ */
+#define CAN_ID_CLEAR_CP         0x112U
+
+/** Set MCU2 operating mode.
+ *  data[0] = 0(IDLE) | 1(LEARN) | 2(AUTO)
+ */
+#define CAN_ID_SET_MODE         0x113U
+
+/* ── MCU2 (Motion MCU) → MCU1 (ESP32) ── */
+
+/** Periodic telemetry broadcast (every 200 ms in LEARN/AUTO mode).
+ *  data[0:1] = steps_L  int16 big-endian  (signed step count left motor)
+ *  data[2:3] = steps_R  int16 big-endian  (signed step count right motor)
+ *  data[4:5] = heading×10  int16 big-endian  (degrees × 10)
+ *  data[6]   = mode   (0/1/2)
+ *  data[7]   = last_cp id
+ */
+#define CAN_ID_TELEMETRY        0x210U
+
+/** IMU data snapshot (every 200 ms in LEARN/AUTO mode).
+ *  data[0:1] = accel_x × 100  int16 big-endian
+ *  data[2:3] = accel_y × 100  int16 big-endian
+ *  data[4:5] = gyro_z  × 10   int16 big-endian
+ */
+#define CAN_ID_IMU_DATA         0x211U
+
+/** Acknowledgment after a SAVE_CP command.
+ *  data[0] = checkpoint_id
+ *  data[1] = result  (0 = OK, 1 = FAIL)
+ */
+#define CAN_ID_CP_SAVED_ACK     0x212U
+
+/* MCU2 operating modes (used in CAN_ID_SET_MODE and CAN_ID_TELEMETRY) */
+#define MCU2_MODE_IDLE          0x00U
+#define MCU2_MODE_LEARN         0x01U
+#define MCU2_MODE_AUTO          0x02U
+
+/* Manual move direction codes (used in CAN_ID_MANUAL_MOVE data[0]) */
+#define MOVE_DIR_FWD            0x00U
+#define MOVE_DIR_BWD            0x01U
+#define MOVE_DIR_LEFT           0x02U
+#define MOVE_DIR_RIGHT          0x03U
+
 #ifdef __cplusplus
 }
 #endif

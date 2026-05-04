@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Robot Control</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:sans-serif;background:#111827;color:#e5e7eb;min-height:100vh;padding:12px}
+h2{text-align:center;color:#38bdf8;margin-bottom:12px;font-size:1.2rem;letter-spacing:.05em}
+.row{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.btn{padding:10px 18px;border:none;border-radius:8px;font-size:13px;font-weight:bold;cursor:pointer;min-width:90px;-webkit-tap-highlight-color:transparent}
+.learn{background:#2563eb;color:#fff}.idle{background:#dc2626;color:#fff}
+.auto{background:#7c3aed;color:#fff}.save{background:#16a34a;color:#fff}
+#jw{display:flex;justify-content:center;margin:14px 0}
+canvas{display:block;touch-action:none}
+.card{background:#1f2937;border-radius:8px;padding:10px 12px;margin-bottom:8px;font-size:13px;line-height:1.9}
+.card span{color:#38bdf8;font-weight:bold}
+#st{text-align:center;font-size:11px;margin-top:6px;color:#6b7280}
+</style>
+</head>
+<body>
+<h2>&#129302; Robot Control</h2>
+
+<div class="row">
+  <button class="btn learn"  id="bLearn"  onclick="setMode(1)">&#128293; Learn</button>
+  <button class="btn idle"   id="bIdle"   onclick="setMode(0)">&#9632; Idle</button>
+  <button class="btn auto"   id="bAuto"   onclick="setMode(2)">&#9654; Auto</button>
+</div>
+<div class="row">
+  <button class="btn save" onclick="saveCP(0)">&#128204; Save Home</button>
+  <button class="btn save" onclick="promptCP()">&#128205; Save Checkpoint</button>
+</div>
+
+<div id="jw"><canvas id="jc" width="220" height="220"></canvas></div>
+
+<div class="card">
+  <div>Steps &nbsp;L: <span id="sL">--</span> &nbsp;&nbsp; R: <span id="sR">--</span></div>
+  <div>Heading: <span id="hdg">--</span>&nbsp;&#176;</div>
+  <div>Mode: <span id="mode">--</span> &nbsp;&nbsp; Last CP: <span id="lcp">--</span></div>
+</div>
+<div class="card">
+  <div>Accel &nbsp;X: <span id="ax">--</span> &nbsp;&nbsp; Y: <span id="ay">--</span></div>
+  <div>Gyro &nbsp;&nbsp;Z: <span id="gz">--</span></div>
+</div>
+
+<div id="st">Connecting...</div>
+
+<script>
+/* ── WebSocket ─────────────────────── */
+var ws, ok = false;
+var MODES = ['Idle', 'Learn', 'Auto'];
+
+function conn() {
+  ws = new WebSocket('ws://' + location.host + '/ws');
+  ws.onopen  = function() { ok = true;  setSt('Connected', '#22c55e'); };
+  ws.onclose = function() { ok = false; setSt('Disconnected — retrying…', '#ef4444'); setTimeout(conn, 2000); };
+  ws.onerror = function() { ws.close(); };
+  ws.onmessage = function(e) {
+    var d; try { d = JSON.parse(e.data); } catch(x) { return; }
+    if (d.type === 'telemetry') {
+      g('sL').textContent   = d.steps_l;
+      g('sR').textContent   = d.steps_r;
+      g('hdg').textContent  = (d.heading / 10).toFixed(1);
+      g('mode').textContent = MODES[d.mode] || d.mode;
+      g('lcp').textContent  = d.last_cp;
+    } else if (d.type === 'imu') {
+      g('ax').textContent = (d.ax / 100).toFixed(2);
+      g('ay').textContent = (d.ay / 100).toFixed(2);
+      g('gz').textContent = (d.gz / 10).toFixed(1);
+    } else if (d.type === 'ack') {
+      setSt('CP ' + d.cp_id + (d.result === 0 ? ' ✓ saved' : ' ✗ failed'), '#facc15');
+    }
+  };
+}
+
+function g(id) { return document.getElementById(id); }
+function setSt(t, c) { var el = g('st'); el.textContent = t; el.style.color = c || '#6b7280'; }
+function send(o) { if (ok) ws.send(JSON.stringify(o)); }
+function saveCP(id) { send({ cmd: 'save_cp', id: id }); }
+function promptCP() {
+  var id = parseInt(prompt('Checkpoint ID (1-15):'), 10);
+  if (!isNaN(id) && id >= 1 && id <= 15) saveCP(id);
+}
+function setMode(m) { send({ cmd: 'set_mode', mode: m }); }
+
+/* ── Joystick canvas ──────────────── */
+var jc  = g('jc');
+var ctx = jc.getContext('2d');
+var CX = 110, CY = 110, R = 98, KR = 32;
+var active = false, knobX = CX, knobY = CY;
+var moveTimer = null, lastDir = -1;
+
+function drawJ(nx, ny) {
+  ctx.clearRect(0, 0, 220, 220);
+  /* outer ring */
+  ctx.beginPath(); ctx.arc(CX, CY, R, 0, 2*Math.PI);
+  ctx.strokeStyle = '#374151'; ctx.lineWidth = 3; ctx.stroke();
+  /* centre mark */
+  ctx.beginPath(); ctx.arc(CX, CY, 6, 0, 2*Math.PI);
+  ctx.fillStyle = '#374151'; ctx.fill();
+  /* direction arrows */
+  var arr = [[CX, CY-R+16, '▲'], [CX, CY+R-16, '▼'],
+             [CX-R+16, CY, '◀'], [CX+R-16, CY, '▶']];
+  ctx.fillStyle = '#4b5563'; ctx.font = '14px sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  arr.forEach(function(a) { ctx.fillText(a[2], a[0], a[1]); });
+  /* knob */
+  var g2 = ctx.createRadialGradient(nx-6, ny-6, 4, nx, ny, KR);
+  g2.addColorStop(0, '#60a5fa'); g2.addColorStop(1, '#1d4ed8');
+  ctx.beginPath(); ctx.arc(nx, ny, KR, 0, 2*Math.PI);
+  ctx.fillStyle = g2; ctx.fill();
+  ctx.strokeStyle = '#93c5fd'; ctx.lineWidth = 2; ctx.stroke();
+}
+
+function jPos(e) {
+  var r = jc.getBoundingClientRect();
+  var t = e.touches ? e.touches[0] : e;
+  var dx = t.clientX - r.left - CX;
+  var dy = t.clientY - r.top  - CY;
+  var d  = Math.sqrt(dx*dx + dy*dy);
+  if (d > R - KR) { var s = (R-KR)/d; dx *= s; dy *= s; }
+  return [CX + dx, CY + dy];
+}
+
+function getDir(dx, dy) {
+  if (Math.abs(dx) > Math.abs(dy)) return dx > 0 ? 3 : 2; /* right : left */
+  return dy < 0 ? 0 : 1;                                   /* fwd   : bwd  */
+}
+
+function doMove(nx, ny) {
+  var dx = nx - CX, dy = ny - CY;
+  var dist = Math.sqrt(dx*dx + dy*dy);
+  if (dist < 14) { stopJ(); return; }
+  var dir = getDir(dx, dy);
+  var spd = Math.min(300 + Math.round(dist * 8), 2000);
+  var fire = function() { send({ cmd: 'move', dir: dir, steps: 20, speed: spd }); };
+  fire();
+  if (dir !== lastDir) {
+    clearInterval(moveTimer);
+    moveTimer = setInterval(fire, 150);
+    lastDir = dir;
+  }
+}
+
+function stopJ() {
+  active = false; knobX = CX; knobY = CY;
+  clearInterval(moveTimer); moveTimer = null; lastDir = -1;
+  drawJ(CX, CY);
+  send({ cmd: 'stop' });
+}
+
+/* mouse */
+jc.addEventListener('mousedown', function(e) {
+  active = true; var p = jPos(e); knobX=p[0]; knobY=p[1]; drawJ(knobX,knobY); doMove(knobX,knobY);
+});
+jc.addEventListener('mousemove', function(e) {
+  if (!active) return; var p = jPos(e); knobX=p[0]; knobY=p[1]; drawJ(knobX,knobY); doMove(knobX,knobY);
+});
+jc.addEventListener('mouseup',    stopJ);
+jc.addEventListener('mouseleave', stopJ);
+
+/* touch */
+jc.addEventListener('touchstart', function(e) {
+  e.preventDefault(); active=true; var p=jPos(e); knobX=p[0]; knobY=p[1]; drawJ(knobX,knobY); doMove(knobX,knobY);
+}, {passive: false});
+jc.addEventListener('touchmove', function(e) {
+  e.preventDefault(); if(!active) return; var p=jPos(e); knobX=p[0]; knobY=p[1]; drawJ(knobX,knobY); doMove(knobX,knobY);
+}, {passive: false});
+jc.addEventListener('touchend', function(e) {
+  e.preventDefault(); stopJ();
+}, {passive: false});
+
+drawJ(CX, CY);
+conn();
+</script>
+</body>
+</html>

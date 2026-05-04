@@ -1,13 +1,16 @@
 /**
  * @file    app_main.c
- * @brief   MCU1 — Simple CAN + OLED test (3 tasks)
+ * @brief   MCU1 — CAN monitor + OLED + WiFi AP joystick control
  *
- *  canRxTask  (prio 3): blocks on twai_receive → pushes to oledQueue
- *  canTxTask  (prio 2): blocks on vTaskDelay 2s → sends heartbeat 0x105
- *  oledTask   (prio 1): blocks on oledQueue 1s timeout → draws on OLED
+ *  canRxTask  (prio 3): twai_receive → oledQueue + WS broadcast (0x210/211/212)
+ *  canTxTask  (prio 2): sends heartbeat 0x105 every 2s
+ *  oledTask   (prio 1): draws latest CAN frame on SSD1306
+ *  canAlertTask (prio 1): logs TWAI bus errors
  *
- *  TWAI:  TX=GPIO5   RX=GPIO4   @1Mbps  (matches MCU2/MCU3)
- *  OLED:  SDA=GPIO21 SCL=GPIO22  SSD1306 128x64 I2C
+ *  WiFi AP:   SSID "RobotControl"  Pass "robot1234"  IP 192.168.4.1
+ *  WS server: ws://192.168.4.1/ws  (joystick + telemetry)
+ *  TWAI:      TX=GPIO5  RX=GPIO4   @1Mbps
+ *  OLED:      SDA=GPIO21 SCL=GPIO22  SSD1306 128×64 I2C
  */
 
 #include <stdio.h>
@@ -16,10 +19,16 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
 #include "driver/twai.h"
 
 #include <u8g2.h>
 #include "u8g2_esp32_hal.h"
+
+#include "wifi_ap_ws.h"
+#include "robot_types.h"
 
 /* ── Pin definitions ───────────────────────── */
 #define PIN_SDA     21
@@ -29,6 +38,8 @@
 
 /* ── CAN IDs (matching MCU2/MCU3) ──────────── */
 #define CAN_ID_HEARTBEAT_MCU1   0x105
+#define CAN_ID_TEST_PING        0x100   /* MCU1 → MCU3 test ping */
+#define CAN_ID_TEST_ECHO        0x200   /* MCU3 → MCU1 echo     */
 
 static const char *TAG = "MCU1";
 
@@ -42,6 +53,7 @@ typedef struct {
 /* ── Shared handles ────────────────────────── */
 static QueueHandle_t oledQueue = NULL;
 static u8g2_t u8g2;
+static volatile uint8_t g_tx_counter = 0;
 
 /* ══════════════════════════════════════════════
  *  canRxTask — Priority 3
@@ -66,6 +78,45 @@ static void canRxTask(void *arg)
                  rx.data_length_code,
                  rx.data_length_code > 0 ? rx.data[0] : 0);
 
+        /* ── Forward teach-and-replay telemetry to WebSocket clients ── */
+        char ws_json[128];
+        switch (rx.identifier) {
+
+        case CAN_ID_TELEMETRY: {  /* 0x210 */
+            int16_t steps_l = (int16_t)((rx.data[0] << 8) | rx.data[1]);
+            int16_t steps_r = (int16_t)((rx.data[2] << 8) | rx.data[3]);
+            int16_t heading = (int16_t)((rx.data[4] << 8) | rx.data[5]);
+            snprintf(ws_json, sizeof(ws_json),
+                     "{\"type\":\"telemetry\","
+                     "\"steps_l\":%d,\"steps_r\":%d,"
+                     "\"heading\":%d,\"mode\":%d,\"last_cp\":%d}",
+                     steps_l, steps_r, heading, rx.data[6], rx.data[7]);
+            wifi_ap_ws_broadcast(ws_json);
+            break;
+        }
+
+        case CAN_ID_IMU_DATA: {  /* 0x211 */
+            int16_t ax = (int16_t)((rx.data[0] << 8) | rx.data[1]);
+            int16_t ay = (int16_t)((rx.data[2] << 8) | rx.data[3]);
+            int16_t gz = (int16_t)((rx.data[4] << 8) | rx.data[5]);
+            snprintf(ws_json, sizeof(ws_json),
+                     "{\"type\":\"imu\",\"ax\":%d,\"ay\":%d,\"gz\":%d}",
+                     ax, ay, gz);
+            wifi_ap_ws_broadcast(ws_json);
+            break;
+        }
+
+        case CAN_ID_CP_SAVED_ACK:  /* 0x212 */
+            snprintf(ws_json, sizeof(ws_json),
+                     "{\"type\":\"ack\",\"cp_id\":%d,\"result\":%d}",
+                     rx.data[0], rx.data[1]);
+            wifi_ap_ws_broadcast(ws_json);
+            break;
+
+        default:
+            break;
+        }
+
         oled_msg_t msg = {
             .can_id = rx.identifier,
             .len    = rx.data_length_code,
@@ -79,27 +130,27 @@ static void canRxTask(void *arg)
 
 /* ══════════════════════════════════════════════
  *  canTxTask — Priority 2
- *  BLOCKS ON: vTaskDelay(2000ms)
- *  Sends heartbeat 0x105 with incrementing counter
+ *  Sends test ping 0x100 to MCU3 every 1s
+ *  data[0]=0xAA  data[1]=counter
  * ══════════════════════════════════════════════ */
 static void canTxTask(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "[canTx] Task started");
-    uint8_t counter = 0;
+    ESP_LOGI(TAG, "[canTx] Task started — sending 0x100 to MCU3 every 1s");
 
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
 
         twai_message_t frame = {
-            .identifier       = CAN_ID_HEARTBEAT_MCU1,
-            .data_length_code = 1,
-            .data             = { counter++ },
+            .identifier       = CAN_ID_TEST_PING,
+            .data_length_code = 2,
+            .data             = { 0xAA, g_tx_counter },
         };
 
         esp_err_t err = twai_transmit(&frame, pdMS_TO_TICKS(100));
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "[canTx] Heartbeat #%d sent", counter - 1);
+            ESP_LOGI(TAG, "[canTx] PING 0x100 cnt=%d", g_tx_counter);
+            g_tx_counter++;
         } else {
             ESP_LOGW(TAG, "[canTx] TX fail: %s", esp_err_to_name(err));
         }
@@ -126,34 +177,36 @@ static void oledTask(void *arg)
         u8g2_SetFont(&u8g2, u8g2_font_6x10_tr);
 
         /* Header */
-        u8g2_DrawStr(&u8g2, 0, 10, "MCU1 CAN Monitor");
+        u8g2_DrawStr(&u8g2, 0, 10, "CAN Test MCU1<->MCU3");
         u8g2_DrawHLine(&u8g2, 0, 12, 128);
+
+        char line[32];
+
+        /* TX line — always shows latest ping counter */
+        snprintf(line, sizeof(line), "TX>0x100  cnt:%d",
+                 (int)g_tx_counter);
+        u8g2_DrawStr(&u8g2, 0, 24, line);
 
         if (got == pdTRUE) {
             rx_count++;
-            char line[32];
 
-            snprintf(line, sizeof(line), "ID: 0x%03lX  len:%d",
-                     (unsigned long)msg.can_id, msg.len);
-            u8g2_DrawStr(&u8g2, 0, 26, line);
-
-            snprintf(line, sizeof(line), "D: %02X %02X %02X %02X",
-                     msg.data[0], msg.data[1], msg.data[2], msg.data[3]);
+            snprintf(line, sizeof(line), "RX<0x%03lX d:%02X %02X",
+                     (unsigned long)msg.can_id,
+                     msg.data[0], msg.data[1]);
             u8g2_DrawStr(&u8g2, 0, 38, line);
 
             snprintf(line, sizeof(line), "   %02X %02X %02X %02X",
-                     msg.data[4], msg.data[5], msg.data[6], msg.data[7]);
+                     msg.data[2], msg.data[3], msg.data[4], msg.data[5]);
             u8g2_DrawStr(&u8g2, 0, 50, line);
 
-            snprintf(line, sizeof(line), "RX count: %lu",
+            snprintf(line, sizeof(line), "RX total:%lu",
                      (unsigned long)rx_count);
             u8g2_DrawStr(&u8g2, 0, 62, line);
         } else {
-            u8g2_DrawStr(&u8g2, 0, 30, "Waiting for CAN...");
-            char line[32];
-            snprintf(line, sizeof(line), "RX total: %lu",
+            u8g2_DrawStr(&u8g2, 0, 38, "RX: waiting...");
+            snprintf(line, sizeof(line), "RX total:%lu",
                      (unsigned long)rx_count);
-            u8g2_DrawStr(&u8g2, 0, 50, line);
+            u8g2_DrawStr(&u8g2, 0, 62, line);
         }
 
         u8g2_SendBuffer(&u8g2);
@@ -267,12 +320,28 @@ static esp_err_t can_init(void)
 /* ── app_main ──────────────────────────────── */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "=== MCU1 CAN + OLED Test ===");
+    ESP_LOGI(TAG, "=== MCU1 CAN + OLED + WiFi AP ===");
+
+    /* NVS flash (required by WiFi driver) */
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+
+    /* TCP/IP stack + default event loop (required by WiFi) */
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     oled_init();
     vTaskDelay(pdMS_TO_TICKS(500));
 
     ESP_ERROR_CHECK(can_init());
+
+    /* Start WiFi AP + WebSocket server */
+    ESP_ERROR_CHECK(wifi_ap_ws_init());
 
     oledQueue = xQueueCreate(1, sizeof(oled_msg_t));
     configASSERT(oledQueue);

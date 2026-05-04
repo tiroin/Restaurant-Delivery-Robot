@@ -12,19 +12,15 @@ dependencies:
       type: git
     version: 4ddd714deabdb45885174724306637f2274d4f6b
   nixy4/u8g2:
-    component_hash: d23326bf33da6b0a41ef16caa527689d770bcb7c469d8d57ca18a42f4cfed81b
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=5.0'
+    dependencies: []
     source:
-      registry_url: https://components.espressif.com/
-      type: service
+      path: components/nixy4__u8g2
+      type: local
     version: 0.1.4
 direct_dependencies:
 - idf
 - mkfrey/u8g2-hal-esp-idf
 - nixy4/u8g2
-manifest_hash: 4dbe7a275285fb83603a062e6a00b39a73ca7d90180c63419069a2c2caaa0ad6
+manifest_hash: 6336bdedcb22bb9fc4edbd16b8ef8614109d6a44bdacbd3c8b40bf268318b5eb
 target: esp32
 version: 3.0.0
