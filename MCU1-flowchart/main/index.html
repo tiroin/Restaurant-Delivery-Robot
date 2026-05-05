@@ -229,6 +229,9 @@ var dbg = {
   replayLog: [],           /* [{dir, cmdMs, actualMs, lag}] */
   /* event log */
   events: [],              /* [{ts, tag, detail, cls}] */
+  /* BLE TX log — every write recorded for ordering analysis */
+  txSeq: 0,
+  txLog: [],               /* [{ts, seq, cmd, ms, ok, err}] */
   hidden: false,
   lastMoveTs: 0            /* last time a move/stop command was sent */
 };
@@ -593,9 +596,28 @@ function onBleNotify(event) {
 function setSt(t)      { document.getElementById('stmsg').textContent = t; }
 function setText(id,t) { document.getElementById(id).textContent = t; }
 function send(o) {
-  if (!cmdChar || !ok) return;
+  if (!cmdChar || !ok) {
+    dbgEvent('tx-DROP', 'no BLE: '+JSON.stringify(o), 'E');
+    return;
+  }
+  var seq = ++dbg.txSeq;
+  var t0 = Date.now();
+  var entry = { ts:'+'+((t0-dbg.t0)/1000).toFixed(3)+'s', seq:seq, cmd:JSON.stringify(o), ms:0, ok:null, err:null };
+  dbg.txLog.push(entry);
+  if (dbg.txLog.length > 60) dbg.txLog.shift();
   cmdChar.writeValueWithoutResponse(new TextEncoder().encode(JSON.stringify(o)))
-    .catch(function(e) { console.warn('BLE write:', e); });
+    .then(function() {
+      entry.ms = Date.now() - t0;
+      entry.ok = true;
+      if (entry.ms > 100) dbgEvent('tx-SLOW', '#'+seq+' '+entry.cmd+' took '+entry.ms+'ms', 'W');
+    })
+    .catch(function(e) {
+      entry.ms = Date.now() - t0;
+      entry.ok = false;
+      entry.err = String(e && e.message || e).substring(0,60);
+      dbgEvent('tx-FAIL', '#'+seq+' '+entry.cmd+' err='+entry.err, 'E');
+      console.warn('BLE write:', e);
+    });
   if (o.cmd==='move'||o.cmd==='stop') dbg.lastMoveTs = Date.now();
 }
 
@@ -1184,7 +1206,7 @@ function clearDbgLog() {
   dbg.events = []; dbg.timerIntervals = []; dbg.gyroIntervals = [];
   dbg.accelIntervals = []; dbg.wsIntervals = [];
   dbg.replayLog = []; dbg.calResult = null; dbg.calSamples = [];
-  dbg.gapLog = [];
+  dbg.gapLog = []; dbg.txLog = []; dbg.txSeq = 0;
   dbg.gyroHist = { '<100':0, '100-200':0, '200-300':0, '300-500':0, '500-1000':0, '>=1000':0 };
   dbg.t0 = Date.now();
   dbg.gyroPktCount = 0; dbg.accelPktCount = 0; dbg.wsPktCount = 0;
