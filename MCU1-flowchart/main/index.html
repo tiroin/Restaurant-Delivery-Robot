@@ -1490,6 +1490,8 @@ function runNextLeg() {
     setSt('Delivery complete ✓');
     document.getElementById('planInfo').textContent += '\n✓ All deliveries done';
     _delivery = null;
+    /* Clear any stale SC callback so it cannot fire stopMove() during manual drive */
+    pendingOdoCb = null; pendingOdoDir = -1; ++pendingOdoSeq;
     return;
   }
   var leg = d.legs[d.idx];
@@ -1519,6 +1521,9 @@ function cancelDelivery() {
   if (_delivery) _delivery.abort = true;
   if (replaying) { replaying = false; stopMove(); setReplayBtn(false); }
   _delivery = null;
+  /* Invalidate any in-flight SC driveFor so its late stopMove() doesn't kill
+     the manual-drive rafLoop after the user re-takes control. */
+  pendingOdoCb = null; pendingOdoDir = -1; ++pendingOdoSeq;
   setSt('Delivery cancelled');
 }
 
