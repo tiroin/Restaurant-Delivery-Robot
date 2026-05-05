@@ -877,9 +877,9 @@ function toggleRecord() {
    constant and the only control variable is time.
 ═══════════════════════════════════════════════════════════════════════ */
 
-/* Drive direction `dir` for `ms` milliseconds, then call onDone. */
+/* Drive direction `dir` for `ms` milliseconds, then call onDone(lag_ms). */
 function driveFor(dir, ms, onDone) {
-  if (ms <= 50) { setTimeout(onDone, 50); return; }
+  if (ms <= 50) { setTimeout(function() { onDone(0); }, 50); return; }
   var _t0 = Date.now();
   dbgEvent('driveFor', ['FWD','BWD','LEFT','RIGHT'][dir] + ' cmd=' + ms + 'ms');
   send({cmd:'move', dir:dir, steps:STEPS});
@@ -902,8 +902,8 @@ function driveFor(dir, ms, onDone) {
     dbgEvent('driveFor-stop', ['FWD','BWD','LEFT','RIGHT'][dir]+' actual='+_actual+'ms lag=+'+_lag+'ms', _lag > 50 ? 'W' : 'G');
     cancelAnimationFrame(_rafHandle);
     send({cmd:'stop'});
-    applyTime(dir, ms);
-    setTimeout(onDone, 250);
+    applyTime(dir, _actual);  /* use actual elapsed — more accurate odometry */
+    setTimeout(function() { onDone(_lag); }, 100);  /* settle 100ms, pass lag to caller */
   }, ms);
 }
 
@@ -916,7 +916,7 @@ function doReplay(segments, onDone) {
   replaying = true;
   setReplayBtn(true);
   var i = 0;
-  function next() {
+  function next(prevLag) {
     if (!replaying || i >= segments.length) {
       replaying = false;
       stopMove();
@@ -925,12 +925,14 @@ function doReplay(segments, onDone) {
       return;
     }
     var seg = segments[i++];
+    /* Subtract previous segment's overrun so error doesn't accumulate */
+    var adjDur = Math.max(50, seg.dur - Math.max(0, prevLag || 0));
     setSt('Replay ' + i + '/' + segments.length +
           '  dir=' + ['FWD','BWD','LEFT','RIGHT'][seg.dir] +
-          '  ' + seg.dur + 'ms');
-    driveFor(seg.dir, seg.dur, next);
+          '  ' + adjDur + 'ms' + (prevLag > 5 ? ' (adj -'+prevLag+'ms)' : ''));
+    driveFor(seg.dir, adjDur, next);
   }
-  next();
+  next(0);
 }
 
 function toggleReplay() {
