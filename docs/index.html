@@ -906,10 +906,38 @@ function toggleRecord() {
 /* Drive direction `dir` for `ms` milliseconds (or `stepsTarget` hardware steps if >=50),
    then call onDone(lag_ms). */
 function driveFor(dir, ms, onDone, stepsTarget) {
-  /* ── TIME-BASED MODE with rAF keepalive ──
-     Step-count closed-loop replay requires MCU2 keepalive support (future).
-     For now: time-based always; odo ACK updates recorded steps for accuracy
-     tracking but does not control replay timing. */
+  /* ── STEP-COUNT CLOSED-LOOP MODE ──
+     MCU2 counts steps in hardware and self-stops; browser waits for odo ACK.
+     Immune to setTimeout jitter. Watchdog fires at 2×ms+2s if BLE drops. */
+  if (stepsTarget >= 50) {
+    dbgEvent('driveFor-steps', ['FWD','BWD','LEFT','RIGHT'][dir] + ' target=' + stepsTarget + ' steps');
+    send({cmd:'move', dir:dir, steps:stepsTarget});
+    var wdg = setTimeout(function() {
+      if (!pendingOdoCb) return;
+      pendingOdoCb = null;
+      dbgEvent('driveFor-steps-WDG', 'watchdog at ' + ms + 'ms', 'W');
+      send({cmd:'stop'});
+      applyTime(dir, ms);
+      setTimeout(function() { onDone(0); }, 100);
+    }, ms * 2 + 2000);
+    pendingOdoCb = function(steps) {
+      clearTimeout(wdg);
+      send({cmd:'stop'});  /* belt-and-suspenders: MCU2 already stopped */
+      /* Update odometry from real step count (FWD/BWD only; turns use time-based) */
+      if (dir === 0 || dir === 1) {
+        var rad = heading * Math.PI / 180;
+        if (dir === 0) { posX += steps * Math.sin(rad); posY += steps * Math.cos(rad); }
+        else           { posX -= steps * Math.sin(rad); posY -= steps * Math.cos(rad); }
+        setText('px', posX.toFixed(0)); setText('py', posY.toFixed(0));
+        setText('pdist', Math.sqrt(posX*posX + posY*posY).toFixed(0));
+      } else {
+        applyTime(dir, ms);  /* turns: time-based heading */
+      }
+      setTimeout(function() { onDone(0); }, 100);
+    };
+    return;
+  }
+  /* ── TIME-BASED MODE (fallback / manual / old routes without steps) ── */
   if (ms <= 50) { setTimeout(function() { onDone(0); }, 50); return; }
   var _t0 = Date.now();
   dbgEvent('driveFor', ['FWD','BWD','LEFT','RIGHT'][dir] + ' cmd=' + ms + 'ms');
@@ -961,7 +989,7 @@ function doReplay(segments, onDone) {
     setSt('Replay ' + i + '/' + segments.length +
           '  dir=' + ['FWD','BWD','LEFT','RIGHT'][seg.dir] +
           '  ' + adjDur + 'ms' + (prevLag > 5 ? ' (adj -'+prevLag+'ms)' : ''));
-    driveFor(seg.dir, adjDur, next, seg.steps || 0);
+    driveFor(seg.dir, adjDur, next);
   }
   next(0);
 }
