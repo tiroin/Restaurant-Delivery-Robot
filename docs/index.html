@@ -589,7 +589,32 @@ function onBleNotify(event) {
   try { d = JSON.parse(new TextDecoder().decode(event.target.value)); }
   catch(x) { dbgEvent('ble-parse-err', '', 'E'); return; }
 
-  if (d.type === 'accel') {
+  if (d.type === 'imu') {
+    /* merged accel+gyro packet (firmware ≥ this build) — 1 notify per pair */
+    if (dbg.accelPktTs > 0) {
+      var _ag = _now0 - dbg.accelPktTs;
+      dbgRolling(dbg.accelIntervals, _ag, 60);
+      if (_ag >= 400) dbgLogGap(_ag, 'imu');
+    }
+    dbg.accelPktTs = _now0; dbg.accelPktCount++;
+    if (_now0 - dbg.accelRateTs >= 2000) {
+      dbg.accelRate = dbg.accelRateCount / ((_now0 - dbg.accelRateTs) / 1000);
+      dbg.accelRateCount = 0; dbg.accelRateTs = _now0;
+    }
+    dbg.accelRateCount++;
+    imu.ax=d.ax; imu.ay=d.ay; imu.az=d.az;
+    setText('iax', (d.ax/100).toFixed(3)+' g');
+    setText('iay', (d.ay/100).toFixed(3)+' g');
+    setText('iaz', (d.az/100).toFixed(3)+' g');
+    imu.gx=d.gx; imu.gy=d.gy; imu.gz=d.gz;
+    setText('igx', ((d.gx-bias.gx)/10).toFixed(1)+' °/s');
+    setText('igy', ((d.gy-bias.gy)/10).toFixed(1)+' °/s');
+    setText('igz', ((d.gz-bias.gz)/10).toFixed(1)+' °/s');
+    imuPkts++; setText('cnt', 'pkts: '+imuPkts);
+    integrateHeading();
+    updateBiasIfStill();
+  } else if (d.type === 'accel') {
+    /* legacy separate-packet path (old firmware) */
     if (dbg.accelPktTs > 0) {
       var _ag = _now0 - dbg.accelPktTs;
       dbgRolling(dbg.accelIntervals, _ag, 60);

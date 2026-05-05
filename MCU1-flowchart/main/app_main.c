@@ -109,32 +109,32 @@ static void canRxTask(void *arg)
             break;
         }
 
-        case CAN_ID_IMU_ACCEL: {  /* 0x211 — accelerometer */
+        case CAN_ID_IMU_ACCEL: {  /* 0x211 — buffer; merged with gyro on next 0x213 */
             g_n_accel++;
-            int16_t ax = (int16_t)((rx.data[0] << 8) | rx.data[1]);
-            int16_t ay = (int16_t)((rx.data[2] << 8) | rx.data[3]);
-            int16_t az = (int16_t)((rx.data[4] << 8) | rx.data[5]);
-            g_ax = ax; g_ay = ay; g_az = az;
+            g_ax = (int16_t)((rx.data[0] << 8) | rx.data[1]);
+            g_ay = (int16_t)((rx.data[2] << 8) | rx.data[3]);
+            g_az = (int16_t)((rx.data[4] << 8) | rx.data[5]);
             ESP_LOGI(TAG, "[canRx] ACCEL ax=%.2fg ay=%.2fg az=%.2fg",
-                     ax / 100.0f, ay / 100.0f, az / 100.0f);
-            snprintf(ws_json, sizeof(ws_json),
-                     "{\"type\":\"accel\",\"ax\":%d,\"ay\":%d,\"az\":%d}",
-                     ax, ay, az);
-            ble_robot_notify(ws_json);
+                     g_ax / 100.0f, g_ay / 100.0f, g_az / 100.0f);
+            /* Do NOT notify here — wait for gyro to send a single merged packet */
             break;
         }
 
-        case CAN_ID_IMU_GYRO: {  /* 0x213 — gyroscope: values in 0.1°/s units (divide by 10 for °/s) */
+        case CAN_ID_IMU_GYRO: {  /* 0x213 — send merged imu packet (accel already buffered) */
             g_n_gyro++;
-            int16_t gx = (int16_t)((rx.data[0] << 8) | rx.data[1]);
-            int16_t gy = (int16_t)((rx.data[2] << 8) | rx.data[3]);
-            int16_t gz = (int16_t)((rx.data[4] << 8) | rx.data[5]);
-            g_gx = gx; g_gy = gy; g_gz = gz;
+            g_gx = (int16_t)((rx.data[0] << 8) | rx.data[1]);
+            g_gy = (int16_t)((rx.data[2] << 8) | rx.data[3]);
+            g_gz = (int16_t)((rx.data[4] << 8) | rx.data[5]);
             ESP_LOGI(TAG, "[canRx] GYRO  gx=%.1f gy=%.1f gz=%.1f deg/s",
-                     gx / 10.0f, gy / 10.0f, gz / 10.0f);
+                     g_gx / 10.0f, g_gy / 10.0f, g_gz / 10.0f);
+            /* One merged notification instead of two separate ones.
+               Halves BLE notify rate (4/s → 2/s) and eliminates back-to-back
+               bursts that saturate the NimBLE ATT buffer pool and delay writes. */
             snprintf(ws_json, sizeof(ws_json),
-                     "{\"type\":\"gyro\",\"gx\":%d,\"gy\":%d,\"gz\":%d}",
-                     gx, gy, gz);
+                     "{\"type\":\"imu\","
+                     "\"ax\":%d,\"ay\":%d,\"az\":%d,"
+                     "\"gx\":%d,\"gy\":%d,\"gz\":%d}",
+                     g_ax, g_ay, g_az, g_gx, g_gy, g_gz);
             ble_robot_notify(ws_json);
             break;
         }
