@@ -1,0 +1,5 @@
+../Core/Src/flash_storage.c:10:24:cp_addr	16	static
+../Core/Src/flash_storage.c:18:6:flash_storage_init	4	static
+../Core/Src/flash_storage.c:24:19:flash_storage_erase_all	40	static
+../Core/Src/flash_storage.c:42:19:flash_storage_save_cp	320	static
+../Core/Src/flash_storage.c:101:19:flash_storage_load_cp	16	static

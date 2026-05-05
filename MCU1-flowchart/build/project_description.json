@@ -1730,12 +1730,12 @@
             "dir": "/home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/main",
             "type": "LIBRARY",
             "lib": "__idf_main",
-            "reqs": [ "esp_wifi", "esp_http_server", "esp_netif", "esp_event", "nvs_flash", "esp_driver_twai" ],
+            "reqs": [ "bt", "nvs_flash", "esp_driver_twai" ],
             "priv_reqs": [ "mkfrey__u8g2-hal-esp-idf", "nixy4__u8g2" ],
             "managed_reqs": [],
             "managed_priv_reqs": [ "mkfrey__u8g2-hal-esp-idf", "nixy4__u8g2" ],
             "file": "/home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/build/esp-idf/main/libmain.a",
-            "sources": [ "/home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/main/app_main.c", "/home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/main/wifi_ap_ws.c", "/home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/build/index.html.S" ],
+            "sources": [ "/home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/main/app_main.c", "/home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/main/ble_robot.c" ],
             "include_dirs": [ "." ]
         },
         "mbedtls": {
@@ -3873,7 +3873,7 @@
             "dir": "/home/thevien257/Desktop/term/Embedded/Restaurant-Delivery-Robot/MCU1-flowchart/main",
             "source": "project_components",
             "lib": "__idf_main",
-            "reqs": [ "esp_wifi", "esp_http_server", "esp_netif", "esp_event", "nvs_flash", "esp_driver_twai" ],
+            "reqs": [ "bt", "nvs_flash", "esp_driver_twai" ],
             "priv_reqs": [ "mkfrey__u8g2-hal-esp-idf", "nixy4__u8g2" ],
             "managed_reqs": [],
             "managed_priv_reqs": [ "mkfrey__u8g2-hal-esp-idf", "nixy4__u8g2" ],

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include "flash_storage.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
@@ -58,6 +59,28 @@
 #define CAN_ID_PATH_CLEAR       0x303
 #define CAN_ID_NAV_CMD          0x101
 
+/* MCU1 → MCU2 (teach-and-replay) */
+#define CAN_ID_MANUAL_MOVE      0x110U  /* dir, steps BE16, speed BE16 */
+#define CAN_ID_SAVE_CP          0x111U  /* data[0] = checkpoint id     */
+#define CAN_ID_CLEAR_CP         0x112U  /* data[0] = checkpoint id     */
+#define CAN_ID_SET_MODE         0x113U  /* data[0] = 0/1/2             */
+
+/* MCU2 → MCU1 (telemetry) */
+#define CAN_ID_TELEMETRY        0x210U
+#define CAN_ID_IMU_DATA         0x211U
+#define CAN_ID_CP_SAVED_ACK     0x212U
+
+/* Mode constants */
+#define MCU2_MODE_IDLE   0
+#define MCU2_MODE_LEARN  1
+#define MCU2_MODE_AUTO   2
+
+/* Move direction constants */
+#define MOVE_DIR_FWD   0
+#define MOVE_DIR_BWD   1
+#define MOVE_DIR_LEFT  2
+#define MOVE_DIR_RIGHT 3
+
 // ============================================================
 // EVENT GROUP BITS
 // ============================================================
@@ -94,6 +117,16 @@ static EventGroupHandle_t emergencyGroup = NULL;
 static volatile uint32_t stepRemaining = 0;
 // Stepper 2 — decremented in TIM3 ISR
 static volatile uint32_t stepRemaining2 = 0;
+
+/* Teach-and-replay state */
+static volatile int32_t g_steps_l = 0; /* cumulative left  steps */
+static volatile int32_t g_steps_r = 0; /* cumulative right steps */
+static volatile int32_t g_heading_x10 = 0; /* heading ×10, degrees  */
+static volatile uint8_t g_mode = MCU2_MODE_IDLE;
+static volatile uint8_t g_last_cp = 0xFF;
+
+/* Latest raw BMI160 data for telemetry */
+static volatile int16_t g_ax = 0, g_ay = 0, g_gz = 0;
 
 // ============================================================
 // PRINT MACRO
@@ -208,6 +241,29 @@ typedef enum {
 	STEPPER_TURN_RIGHT,
 	STEPPER_STOP
 } StepperCmd;
+
+/* ============================================================
+ * CAN TX HELPER
+ * ============================================================ */
+static HAL_StatusTypeDef can_tx(uint32_t id, const uint8_t *data, uint8_t len) {
+	FDCAN_TxHeaderTypeDef txHdr = { .Identifier = id, .IdType =
+			FDCAN_STANDARD_ID, .TxFrameType = FDCAN_DATA_FRAME, .DataLength =
+			(uint32_t) len << 16U, /* FDCAN_DLC_BYTES_x */
+	.ErrorStateIndicator = FDCAN_ESI_ACTIVE, .BitRateSwitch = FDCAN_BRS_OFF,
+			.FDFormat = FDCAN_CLASSIC_CAN, .TxEventFifoControl =
+					FDCAN_NO_TX_EVENTS, .MessageMarker = 0, };
+	/* Map plain byte count to FDCAN DLC field */
+	const uint32_t dlc_table[] = {
+	FDCAN_DLC_BYTES_0, FDCAN_DLC_BYTES_1, FDCAN_DLC_BYTES_2,
+	FDCAN_DLC_BYTES_3, FDCAN_DLC_BYTES_4, FDCAN_DLC_BYTES_5,
+	FDCAN_DLC_BYTES_6, FDCAN_DLC_BYTES_7, FDCAN_DLC_BYTES_8, };
+	if (len <= 8U) {
+		txHdr.DataLength = dlc_table[len];
+	} else {
+		txHdr.DataLength = FDCAN_DLC_BYTES_8;
+	}
+	return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txHdr, data);
+}
 
 static void stepper_start(GPIO_PinState dir, uint32_t steps, uint32_t speed) {
 	if (steps == 0)
@@ -338,7 +394,7 @@ static void canRxTask(void *arg) {
 		case CAN_ID_EMERGENCY_STOP:
 			PRINT("[MCU2] RX 0x302 EMERGENCY_STOP from MCU3\r\n");
 			xEventGroupSetBits(emergencyGroup,
-					EMERGENCY_STOP_BIT | OBSTACLE_ACTIVE_BIT);
+			EMERGENCY_STOP_BIT | OBSTACLE_ACTIVE_BIT);
 			break;
 		case CAN_ID_PATH_CLEAR:
 			PRINT("[MCU2] RX 0x303 PATH_CLEAR from MCU3\r\n");
@@ -352,6 +408,87 @@ static void canRxTask(void *arg) {
 			PRINT("[MCU2] RX 0x105 HEARTBEAT from MCU1, count=%u\r\n",
 					msg.data[0]);
 			break;
+
+			/* ---- Teach-and-replay commands from MCU1 ---- */
+		case CAN_ID_SET_MODE: {
+			uint8_t new_mode = msg.data[0];
+			if (new_mode <= MCU2_MODE_AUTO) {
+				g_mode = new_mode;
+				PRINT("[MCU2] Mode -> %u\r\n", new_mode);
+			}
+			break;
+		}
+		case CAN_ID_MANUAL_MOVE: {
+			/* data[0]=dir, [1:2]=steps BE16, [3:4]=speed BE16 */
+			uint8_t dir = msg.data[0];
+			uint16_t steps = ((uint16_t) msg.data[1] << 8) | msg.data[2];
+			uint16_t speed = ((uint16_t) msg.data[3] << 8) | msg.data[4];
+			if (speed == 0)
+				speed = STEPPER_SPEED_MED;
+			PRINT("[MCU2] MANUAL_MOVE dir=%u steps=%u speed=%u\r\n", dir, steps,
+					speed);
+			switch (dir) {
+			case MOVE_DIR_FWD:
+				stepper_forward(steps, speed);
+				stepper2_forward(steps, speed);
+				g_steps_l += steps;
+				g_steps_r += steps;
+				break;
+			case MOVE_DIR_BWD:
+				stepper_backward(steps, speed);
+				stepper2_backward(steps, speed);
+				g_steps_l -= steps;
+				g_steps_r -= steps;
+				break;
+			case MOVE_DIR_LEFT:
+				stepper_turn_left(steps, speed);
+				stepper2_turn_right(steps, speed);
+				g_steps_l -= steps;
+				g_steps_r += steps;
+				g_heading_x10 -= (int32_t) steps; /* approx */
+				break;
+			case MOVE_DIR_RIGHT:
+				stepper_turn_right(steps, speed);
+				stepper2_turn_left(steps, speed);
+				g_steps_l += steps;
+				g_steps_r -= steps;
+				g_heading_x10 += (int32_t) steps; /* approx */
+				break;
+			default:
+				break;
+			}
+			break;
+		}
+		case CAN_ID_SAVE_CP: {
+			uint8_t cp_id = msg.data[0];
+			uint8_t ack[2] = { cp_id, 0x01U }; /* default: FAIL */
+			if (cp_id < FLASH_STORAGE_MAX_CP) {
+				HAL_StatusTypeDef st = flash_storage_save_cp(cp_id,
+						(int32_t) g_steps_l, (int32_t) g_steps_r,
+						(int32_t) g_heading_x10);
+				if (st == HAL_OK) {
+					g_last_cp = cp_id;
+					ack[1] = 0x00U; /* OK */
+					PRINT("[MCU2] CP %u saved OK sl=%ld sr=%ld h=%ld\r\n",
+							cp_id, (long )g_steps_l, (long )g_steps_r,
+							(long )g_heading_x10);
+				} else {
+					PRINT("[MCU2] CP %u save FAILED\r\n", cp_id);
+				}
+			}
+			can_tx(CAN_ID_CP_SAVED_ACK, ack, sizeof(ack));
+			break;
+		}
+		case CAN_ID_CLEAR_CP: {
+			flash_storage_erase_all();
+			g_steps_l = 0;
+			g_steps_r = 0;
+			g_heading_x10 = 0;
+			g_last_cp = 0xFF;
+			PRINT("[MCU2] All checkpoints cleared\r\n");
+			break;
+		}
+
 		default:
 			PRINT("[MCU2] RX unknown id=0x%03lX\r\n", msg.identifier);
 			break;
@@ -367,7 +504,7 @@ static void emergencyHandlerTask(void *arg) {
 
 	for (;;) {
 		xEventGroupWaitBits(emergencyGroup, EMERGENCY_STOP_BIT, pdTRUE, pdFALSE,
-				portMAX_DELAY);
+		portMAX_DELAY);
 
 		stepper_stop();
 		stepper2_stop();
@@ -400,7 +537,18 @@ static void bmi160Task(void *arg) {
 
 	uint8_t id = 0;
 	uint8_t cmd = 0;
+	// Check I2C bus state
+	PRINT("[BMI160] I2C ErrorCode=0x%08lX\r\n", hi2c1.ErrorCode);
+	PRINT("[BMI160] I2C State=0x%02X\r\n", hi2c1.State);
 
+	// Try scanning the bus — check both possible BMI160 addresses
+	uint8_t dummy;
+	HAL_StatusTypeDef s1 = HAL_I2C_Mem_Read(&hi2c1, (0x68 << 1), 0x00, 1,
+			&dummy, 1, 100);
+	HAL_StatusTypeDef s2 = HAL_I2C_Mem_Read(&hi2c1, (0x69 << 1), 0x00, 1,
+			&dummy, 1, 100);
+	PRINT("[BMI160] Probe 0x68=%d  0x69=%d  (0=ACK/found, 1=NACK/absent)\r\n",
+			s1, s2);
 	xSemaphoreTake(i2cMutex, portMAX_DELAY);
 
 	// 1. Read Chip ID
@@ -460,7 +608,7 @@ static void bmi160Task(void *arg) {
 
 		xSemaphoreTake(i2cMutex, portMAX_DELAY);
 		HAL_StatusTypeDef ret = HAL_I2C_Mem_Read(&hi2c1, BMI160_ADDR,
-				BMI160_REG_DATA_START, 1, rawData, 12, 100);
+		BMI160_REG_DATA_START, 1, rawData, 12, 100);
 		xSemaphoreGive(i2cMutex);
 
 		if (ret != HAL_OK)
@@ -474,6 +622,14 @@ static void bmi160Task(void *arg) {
 		int16_t ax = (int16_t) ((rawData[7] << 8) | rawData[6]);
 		int16_t ay = (int16_t) ((rawData[9] << 8) | rawData[8]);
 		int16_t az = (int16_t) ((rawData[11] << 8) | rawData[10]);
+
+		/* Update global telemetry snapshot */
+		g_ax = ax;
+		g_ay = ay;
+		g_gz = gz;
+		(void) gx;
+		(void) gy;
+		(void) az;
 
 		// Print every 10th reading to avoid flooding the console (100Hz / 10 = 10Hz print rate)
 		if (++printCounter >= 10) {
@@ -495,7 +651,46 @@ static void bmi160Task(void *arg) {
 }
 
 // ============================================================
-// TASK 5: STEPPER 1 TASK
+// TASK 5: TELEMETRY BROADCAST TASK (200 ms)
+// Sends 0x210 (TELEMETRY) and 0x211 (IMU_DATA) to MCU1 every 200 ms
+// ============================================================
+static void telemetryTask(void *arg) {
+	(void) arg;
+	for (;;) {
+		vTaskDelay(pdMS_TO_TICKS(200));
+
+		/* --- 0x210 TELEMETRY: sl(2) sr(2) heading(2) mode(1) last_cp(1) --- */
+		uint8_t tel[8];
+		int32_t sl = g_steps_l;
+		int32_t sr = g_steps_r;
+		int32_t hd = g_heading_x10;
+		tel[0] = (uint8_t) (sl >> 8);
+		tel[1] = (uint8_t) (sl);
+		tel[2] = (uint8_t) (sr >> 8);
+		tel[3] = (uint8_t) (sr);
+		tel[4] = (uint8_t) ((hd / 10) >> 8);
+		tel[5] = (uint8_t) (hd / 10);
+		tel[6] = g_mode;
+		tel[7] = g_last_cp;
+		can_tx(CAN_ID_TELEMETRY, tel, 8);
+
+		/* --- 0x211 IMU_DATA: ax*100(2) ay*100(2) gz*10(2) --- */
+		uint8_t imu[6];
+		int16_t ax100 = (int16_t) ((int32_t) g_ax * 100 / 16384);
+		int16_t ay100 = (int16_t) ((int32_t) g_ay * 100 / 16384);
+		int16_t gz10 = (int16_t) ((int32_t) g_gz * 10 / 164);
+		imu[0] = (uint8_t) (ax100 >> 8);
+		imu[1] = (uint8_t) (ax100);
+		imu[2] = (uint8_t) (ay100 >> 8);
+		imu[3] = (uint8_t) (ay100);
+		imu[4] = (uint8_t) (gz10 >> 8);
+		imu[5] = (uint8_t) (gz10);
+		can_tx(CAN_ID_IMU_DATA, imu, 6);
+	}
+}
+
+// ============================================================
+// TASK 6: STEPPER 1 TASK
 // ============================================================
 static void stepperTask(void *arg) {
 	(void) arg;
@@ -508,14 +703,14 @@ static void stepperTask(void *arg) {
 		if (xEventGroupGetBits(emergencyGroup) & OBSTACLE_ACTIVE_BIT) {
 			PRINT("[stepper1] Emergency detected - waiting for path clear\r\n");
 			xEventGroupWaitBits(emergencyGroup, PATH_CLEAR_BIT, pdTRUE, pdFALSE,
-					portMAX_DELAY);
+			portMAX_DELAY);
 			PRINT("[stepper1] Resuming\r\n");
 		}
 	}
 }
 
 // ============================================================
-// TASK 6: STEPPER 2 TASK
+// TASK 7: STEPPER 2 TASK
 // ============================================================
 static void stepperTask2(void *arg) {
 	(void) arg;
@@ -528,7 +723,7 @@ static void stepperTask2(void *arg) {
 		if (xEventGroupGetBits(emergencyGroup) & OBSTACLE_ACTIVE_BIT) {
 			PRINT("[stepper2] Emergency detected - waiting for path clear\r\n");
 			xEventGroupWaitBits(emergencyGroup, PATH_CLEAR_BIT, pdTRUE, pdFALSE,
-					portMAX_DELAY);
+			portMAX_DELAY);
 			PRINT("[stepper2] Resuming\r\n");
 		}
 	}
@@ -560,7 +755,7 @@ int main(void) {
 	if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
 		Error_Handler();
 	if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
-			FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE) != HAL_OK)
+	FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE) != HAL_OK)
 		Error_Handler();
 	if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
 		Error_Handler();
@@ -587,10 +782,14 @@ int main(void) {
 	xTaskCreate(bmi160Task, "bmiTask", 384, NULL, 3, &bmiTaskHandle);
 
 	// --- COMMENT THESE OUT FOR NOW TO PREVENT INTERRUPT CRASHES WHILE TESTING ---
-	// xTaskCreate(stepperTask, "stepper1", 256, NULL, 2, &stepTaskHandle);
-	// xTaskCreate(stepperTask2, "stepper2", 256, NULL, 2, &stepTaskHandle2);
-	// xTaskCreate(canRxTask, "canRxTask", 256, NULL, 4, NULL);
-	// xTaskCreate(emergencyHandlerTask, "emergTask", 256, NULL, 5, NULL);
+//	xTaskCreate(stepperTask, "stepper1", 256, NULL, 2, &stepTaskHandle);
+//	xTaskCreate(stepperTask2, "stepper2", 256, NULL, 2, &stepTaskHandle2);
+//	xTaskCreate(canRxTask, "canRxTask", 512, NULL, 4, NULL);
+//	xTaskCreate(emergencyHandlerTask, "emergTask", 256, NULL, 5, NULL);
+//	xTaskCreate(telemetryTask, "telemTask", 256, NULL, 2, NULL);
+
+	/* Initialise flash storage for checkpoints */
+	flash_storage_init();
 
 	vTaskStartScheduler();
 	while (1) {

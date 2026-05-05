@@ -91,11 +91,11 @@
 							<tool id="com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.objcopy.symbolsrec.2058846601" name="MCU Output Converter Motorola S-rec with symbols" superClass="com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.objcopy.symbolsrec"/>
 						</toolChain>
 					</folderInfo>
-					<fileInfo id="com.st.stm32cube.ide.mcu.gnu.managedbuild.config.exe.debug.355352001.1522328358" name="testCAN.c" rcbsApplicability="disable" resourcePath="Core/Src/testCAN.c" toolsToInvoke="com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.1563874576.804776318">
-						<tool id="com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.1563874576.804776318" name="MCU/MPU GCC Compiler" superClass="com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.1563874576"/>
+					<fileInfo id="com.st.stm32cube.ide.mcu.gnu.managedbuild.config.exe.debug.355352001.752123203" name="testStepper.c" rcbsApplicability="disable" resourcePath="Core/Src/testStepper.c" toolsToInvoke="com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.1563874576.831762133">
+						<tool id="com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.1563874576.831762133" name="MCU/MPU GCC Compiler" superClass="com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.1563874576"/>
 					</fileInfo>
 					<sourceEntries>
-						<entry excluding="Src/testCAN.c|Src/testBMI160.c|Src/mainnew.c" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="Core"/>
+						<entry excluding="Src/testStepper.c|Src/testBMI160.c|Src/testCAN.c|Src/mainnew.c" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="Core"/>
 						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="Drivers"/>
 						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="Middlewares"/>
 					</sourceEntries>
@@ -202,15 +202,6 @@
 	</storageModule>
 	<storageModule moduleId="org.eclipse.cdt.core.LanguageSettingsProviders"/>
 	<storageModule moduleId="org.eclipse.cdt.make.core.buildtargets"/>
-	<storageModule moduleId="scannerConfiguration">
-		<autodiscovery enabled="true" problemReportingEnabled="true" selectedProfileId=""/>
-		<scannerConfigBuildInfo instanceId="com.st.stm32cube.ide.mcu.gnu.managedbuild.config.exe.debug.355352001;com.st.stm32cube.ide.mcu.gnu.managedbuild.config.exe.debug.355352001.;com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.1563874576;com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.input.c.1879781041">
-			<autodiscovery enabled="false" problemReportingEnabled="true" selectedProfileId=""/>
-		</scannerConfigBuildInfo>
-		<scannerConfigBuildInfo instanceId="com.st.stm32cube.ide.mcu.gnu.managedbuild.config.exe.release.748050897;com.st.stm32cube.ide.mcu.gnu.managedbuild.config.exe.release.748050897.;com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.1564130684;com.st.stm32cube.ide.mcu.gnu.managedbuild.tool.c.compiler.input.c.1894769767">
-			<autodiscovery enabled="false" problemReportingEnabled="true" selectedProfileId=""/>
-		</scannerConfigBuildInfo>
-	</storageModule>
 	<storageModule moduleId="refreshScope" versionNumber="2">
 		<configuration configurationName="Debug">
 			<resource resourceType="PROJECT" workspacePath="/CANRestaurant"/>
@@ -219,4 +210,5 @@
 			<resource resourceType="PROJECT" workspacePath="/CANRestaurant"/>
 		</configuration>
 	</storageModule>
+	<storageModule moduleId="scannerConfiguration"/>
 </cproject>

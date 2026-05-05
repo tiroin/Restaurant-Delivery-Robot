@@ -1,0 +1,5 @@
+../Core/Src/flash_storage.c:10:24:cp_addr	1
+../Core/Src/flash_storage.c:18:6:flash_storage_init	1
+../Core/Src/flash_storage.c:24:19:flash_storage_erase_all	1
+../Core/Src/flash_storage.c:42:19:flash_storage_save_cp	7
+../Core/Src/flash_storage.c:101:19:flash_storage_load_cp	5

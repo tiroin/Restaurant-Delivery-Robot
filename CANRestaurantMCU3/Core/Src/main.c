@@ -128,6 +128,9 @@ void HAL_FDCAN_TxFifoEmptyCallback(FDCAN_HandleTypeDef *hfdcan) {
 	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
+// DEBUG counters — read from tasks
+static volatile uint32_t dbg_ch2IsrCount = 0;  // incremented in ISR
+
 // ============================================================
 // TIM2 OC CALLBACK — CH1 triggers sensors 1 & 2 simultaneously
 // TIM3 OC CALLBACK — CH1 triggers sensors 3 & 4 simultaneously
@@ -142,6 +145,14 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim) {
 			trigState2 = 1;
 			uint32_t nextCCR = __HAL_TIM_GET_COUNTER(htim) + TRIG_PULSE_US;
 			__HAL_TIM_SET_COMPARE(htim, TIM_CHANNEL_1, nextCCR);
+
+			// DEBUG: confirm TRIG2 (PA4) pulse is being sent
+			static uint32_t trig2Count = 0;
+			trig2Count++;
+			if (trig2Count % 50 == 0) { // print every 50 pulses to avoid flooding
+				printf("[DBG] TRIG2 pulse fired #%lu, PA4 state=%d\r\n",
+						trig2Count, HAL_GPIO_ReadPin(TRIG2_PORT, TRIG2_PIN));
+			}
 		} else {
 			HAL_GPIO_WritePin(TRIG1_PORT, TRIG1_PIN, GPIO_PIN_RESET);
 			HAL_GPIO_WritePin(TRIG2_PORT, TRIG2_PIN, GPIO_PIN_RESET);
@@ -197,6 +208,13 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
 
 	// Sensor 2 Right — TIM2 CH2
 	if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
+
+		// DEBUG: confirm ISR is reached at all
+		static uint32_t ch2IsrCount = 0;
+		ch2IsrCount++;
+		// Note: avoid printf in ISR — set a flag instead
+		// We use a volatile counter, printed from the sonar task
+
 		if (cap2State == 0) {
 			echo2Start = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
 			__HAL_TIM_SET_CAPTUREPOLARITY(htim, TIM_CHANNEL_2,
@@ -328,8 +346,8 @@ static void obstacleAnalysisTask(void *arg) {
 		xQueueReceive(obstacleQueue[2], &dist[2], 0);
 		xQueueReceive(obstacleQueue[3], &dist[3], 0);
 
-		PRINT("[sonar] F:%.1f R:%.1f L:%.1f B:%.1f cm\r\n", dist[0], dist[1],
-				dist[2], dist[3]);
+		PRINT("[sonar] F:%.1f R:%.1f L:%.1f B:%.1f cm\r\n", dist[2], dist[0],
+				dist[1], dist[3]);
 
 		uint8_t anyObstacle = 0;
 		for (int i = 0; i < 4; i++) {

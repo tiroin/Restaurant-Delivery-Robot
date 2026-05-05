@@ -64,8 +64,8 @@ all: main-build
 main-build: CANRestaurantMCU2.elf secondary-outputs
 
 # Tool invocations
-CANRestaurantMCU2.elf CANRestaurantMCU2.map: $(OBJS) $(USER_OBJS) /home/thevien257/Desktop/term/Embedded/CANRestaurant/STM32H503CBTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "CANRestaurantMCU2.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m33 -T"/home/thevien257/Desktop/term/Embedded/CANRestaurant/STM32H503CBTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="CANRestaurantMCU2.map" -Wl,--gc-sections -static -u _printf_float --specs=nano.specs -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+CANRestaurantMCU2.elf CANRestaurantMCU2.map: $(OBJS) $(USER_OBJS) /home/thevien257/Desktop/term/Embedded/CANRestaurantMCU2/STM32H503CBTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "CANRestaurantMCU2.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m33 -T"/home/thevien257/Desktop/term/Embedded/CANRestaurantMCU2/STM32H503CBTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="CANRestaurantMCU2.map" -Wl,--gc-sections -static -u _printf_float --specs=nano.specs -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

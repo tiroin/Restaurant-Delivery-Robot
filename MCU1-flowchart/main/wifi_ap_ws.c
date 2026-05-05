@@ -52,8 +52,12 @@ static void can_tx(uint32_t id, const uint8_t *data, uint8_t len)
     }
     esp_err_t err = twai_transmit(&frame, pdMS_TO_TICKS(10));
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "twai_transmit 0x%03" PRIx32 ": %s",
+        ESP_LOGE(TAG, "twai_transmit 0x%03" PRIx32 " FAIL: %s",
                  id, esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "[CAN-TX] 0x%03" PRIx32 " len=%u  %02X %02X %02X %02X %02X",
+                 id, len, data?data[0]:0, len>1?data[1]:0,
+                 len>2?data[2]:0, len>3?data[3]:0, len>4?data[4]:0);
     }
 }
 
@@ -96,14 +100,18 @@ static int json_get_str(const char *json, const char *key,
  * ══════════════════════════════════════════════ */
 static void handle_ws_message(const char *msg)
 {
+    ESP_LOGI(TAG, "[WS-RX] %s", msg);
     char cmd[24] = {0};
-    if (!json_get_str(msg, "cmd", cmd, sizeof(cmd))) return;
+    if (!json_get_str(msg, "cmd", cmd, sizeof(cmd))) {
+        ESP_LOGW(TAG, "[WS-RX] no cmd field");
+        return;
+    }
 
     if (strcmp(cmd, "move") == 0) {
         /* {"cmd":"move","dir":0-3,"steps":N,"speed":N} */
         uint8_t  dir   = (uint8_t)json_get_int(msg, "dir",   0);
         uint16_t steps = (uint16_t)json_get_int(msg, "steps", 0);
-        uint16_t speed = (uint16_t)json_get_int(msg, "speed", 500);
+        uint16_t speed = 4000;  /* always CRAWL — 125 steps/s */
 
         uint8_t data[5] = {
             dir,
@@ -137,6 +145,7 @@ static void handle_ws_message(const char *msg)
  * ══════════════════════════════════════════════ */
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
+    ESP_LOGW(TAG, ">>>> HTTP GET / from sockfd=%d <<<<", httpd_req_to_sockfd(req));
     size_t len = (size_t)(index_html_end - index_html_start);
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_send(req, (const char *)index_html_start, (ssize_t)len);
@@ -150,7 +159,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
 {
     /* Upgrade handshake (HTTP GET that gets promoted to WS) */
     if (req->method == HTTP_GET) {
-        ESP_LOGI(TAG, "WS client connected fd=%d",
+        ESP_LOGW(TAG, ">>>> WS CLIENT CONNECTED fd=%d <<<<",
                  httpd_req_to_sockfd(req));
         return ESP_OK;
     }
@@ -184,37 +193,79 @@ static esp_err_t ws_handler(httpd_req_t *req)
 
 /* ══════════════════════════════════════════════
  *  Public API — broadcast to all WS clients
+ *
+ *  IMPORTANT: httpd_ws_send_frame_async() is NOT safe to call from
+ *  arbitrary task context. We must defer the send to the httpd
+ *  worker thread via httpd_queue_work(). The JSON string is duplicated
+ *  on the heap and freed by the worker after sending.
  * ══════════════════════════════════════════════ */
-esp_err_t wifi_ap_ws_broadcast(const char *json_str)
+typedef struct {
+    httpd_handle_t hd;
+    int            fd;
+    char          *payload;
+    size_t         len;
+} ws_async_t;
+
+static void ws_async_send(void *arg)
 {
-    if (!s_server || !json_str) return ESP_FAIL;
-
-    /* Get current client count */
-    size_t n = 0;
-    esp_err_t err = httpd_get_client_list(s_server, &n, NULL);
-    if (err != ESP_OK || n == 0) return ESP_OK;
-
-    int *fds = malloc(n * sizeof(int));
-    if (!fds) return ESP_ERR_NO_MEM;
-
-    err = httpd_get_client_list(s_server, &n, fds);
-    if (err != ESP_OK) { free(fds); return err; }
-
+    ws_async_t *a = (ws_async_t *)arg;
     httpd_ws_frame_t frame = {
         .type    = HTTPD_WS_TYPE_TEXT,
-        .payload = (uint8_t *)json_str,
-        .len     = strlen(json_str),
+        .payload = (uint8_t *)a->payload,
+        .len     = a->len,
         .final   = true,
     };
+    httpd_ws_send_frame_async(a->hd, a->fd, &frame);
+    free(a->payload);
+    free(a);
+}
 
-    for (size_t i = 0; i < n; i++) {
-        if (httpd_ws_get_fd_info(s_server, fds[i]) ==
-                HTTPD_WS_CLIENT_WEBSOCKET) {
-            httpd_ws_send_frame_async(s_server, fds[i], &frame);
-        }
+/* Public stats — read by app_main periodic stats task */
+volatile uint32_t g_ws_clients   = 0;
+volatile uint32_t g_ws_queued    = 0;
+volatile uint32_t g_ws_queue_err = 0;
+volatile uint32_t g_ws_no_client = 0;
+volatile uint32_t g_ws_calls     = 0;
+
+esp_err_t wifi_ap_ws_broadcast(const char *json_str)
+{
+    g_ws_calls++;
+    if (!s_server || !json_str) return ESP_FAIL;
+
+    /* httpd_get_client_list: input n = capacity, output n = count filled */
+    size_t n = CONFIG_LWIP_MAX_SOCKETS;  /* safe upper bound */
+    int fds[CONFIG_LWIP_MAX_SOCKETS];
+    if (httpd_get_client_list(s_server, &n, fds) != ESP_OK || n == 0) {
+        g_ws_clients = 0;
+        g_ws_no_client++;
+        return ESP_OK;
     }
 
-    free(fds);
+    size_t json_len = strlen(json_str);
+    uint32_t ws_count = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        if (httpd_ws_get_fd_info(s_server, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET)
+            continue;
+        ws_count++;
+        ws_async_t *a = malloc(sizeof(*a));
+        if (!a) { g_ws_queue_err++; continue; }
+        a->payload = malloc(json_len + 1);
+        if (!a->payload) { free(a); g_ws_queue_err++; continue; }
+        memcpy(a->payload, json_str, json_len + 1);
+        a->hd  = s_server;
+        a->fd  = fds[i];
+        a->len = json_len;
+        if (httpd_queue_work(s_server, ws_async_send, a) != ESP_OK) {
+            free(a->payload); free(a);
+            g_ws_queue_err++;
+        } else {
+            g_ws_queued++;
+        }
+    }
+    g_ws_clients = ws_count;
+    if (ws_count == 0) g_ws_no_client++;
+
     return ESP_OK;
 }
 
@@ -260,11 +311,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         if (id == WIFI_EVENT_AP_STACONNECTED) {
             wifi_event_ap_staconnected_t *e =
                 (wifi_event_ap_staconnected_t *)data;
-            ESP_LOGI(TAG, "Client connected aid=%d", e->aid);
+            ESP_LOGW(TAG, ">>>> STA CONNECTED aid=%d MAC=%02X:%02X:%02X:%02X:%02X:%02X <<<<",
+                     e->aid, e->mac[0],e->mac[1],e->mac[2],e->mac[3],e->mac[4],e->mac[5]);
         } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
             wifi_event_ap_stadisconnected_t *e =
                 (wifi_event_ap_stadisconnected_t *)data;
-            ESP_LOGI(TAG, "Client disconnected aid=%d", e->aid);
+            ESP_LOGW(TAG, ">>>> STA DISCONNECTED aid=%d MAC=%02X:%02X:%02X:%02X:%02X:%02X <<<<",
+                     e->aid, e->mac[0],e->mac[1],e->mac[2],e->mac[3],e->mac[4],e->mac[5]);
         }
     }
 }
@@ -305,6 +358,12 @@ esp_err_t wifi_ap_ws_init(void)
                         TAG, "esp_wifi_set_config failed");
     ESP_RETURN_ON_ERROR(esp_wifi_start(),
                         TAG, "esp_wifi_start failed");
+
+    /* Disable power-save: prevents WiFi radio from sleeping between TX bursts.
+       Without this the modem sleeps ~500-800ms between packets, causing exactly
+       the large WS gaps observed in debug (all streams drop together). */
+    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE),
+                        TAG, "esp_wifi_set_ps failed");
 
     ESP_LOGI(TAG, "WiFi AP ready — SSID:\"%s\"  Pass:\"%s\"  IP:192.168.4.1",
              AP_SSID, AP_PASS);

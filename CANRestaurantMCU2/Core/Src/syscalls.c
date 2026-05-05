@@ -71,8 +71,18 @@ __attribute__((weak)) int _read(int file, char *ptr, int len) {
 
 __attribute__((weak)) int _write(int file, char *ptr, int len) {
 	(void) file;
-	for (int DataIdx = 0; DataIdx < len; DataIdx++) {
-		ITM_SendChar(*ptr++);
+	/* Blocking ITM with bounded wait: behaves like ITM_SendChar when an SWV
+	 * viewer is draining SWO, but gives up after ~50k spin cycles per char so
+	 * the CPU can never be locked forever if no viewer is attached. */
+	if ((ITM->TCR & ITM_TCR_ITMENA_Msk) && (ITM->TER & 1U)) {
+		for (int DataIdx = 0; DataIdx < len; DataIdx++) {
+			uint32_t guard = 50000U;
+			while ((ITM->PORT[0].u32 == 0U) && (--guard != 0U)) {
+				__NOP();
+			}
+			ITM->PORT[0].u8 = (uint8_t)(*ptr);
+			ptr++;
+		}
 	}
 	return len;
 }
