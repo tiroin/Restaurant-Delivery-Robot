@@ -1,0 +1,23 @@
+# ESP-IDF build output
+**/build/
+**/.cache/
+**/*.o
+**/*.a
+**/*.elf
+**/*.bin
+**/*.map
+**/*.list
+
+# Eclipse / STM32CubeIDE
+.metadata/
+**/.settings/
+**/.cproject
+**/.project
+
+# macOS / Linux
+.DS_Store
+*.swp
+*~
+
+# VS Code
+.vscode/

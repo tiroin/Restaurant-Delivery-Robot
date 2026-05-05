@@ -1,14 +1,10 @@
 idf_component_register(
     SRCS
         "app_main.c"
-        "wifi_ap_ws.c"
+        "ble_robot.c"
     INCLUDE_DIRS "."
-    EMBED_FILES  "index.html"
     REQUIRES
-        esp_wifi
-        esp_http_server
-        esp_netif
-        esp_event
+        bt
         nvs_flash
         esp_driver_twai
 )

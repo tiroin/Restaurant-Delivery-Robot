@@ -19,15 +19,13 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
-#include "esp_event.h"
-#include "esp_netif.h"
 #include "nvs_flash.h"
 #include "driver/twai.h"
 
 #include <u8g2.h>
 #include "u8g2_esp32_hal.h"
 
-#include "wifi_ap_ws.h"
+#include "ble_robot.h"
 #include "robot_types.h"
 
 /* ── Pin definitions ───────────────────────── */
@@ -40,7 +38,7 @@
 #define CAN_ID_HEARTBEAT_MCU1   0x105
 #define CAN_ID_TEST_PING        0x100   /* MCU1 → MCU3 test ping */
 #define CAN_ID_TEST_ECHO        0x200   /* MCU3 → MCU1 echo     */
-
+/* CAN_ID_IMU_ACCEL 0x211 and CAN_ID_IMU_GYRO 0x213 come from robot_types.h */
 static const char *TAG = "MCU1";
 
 /* ── Message passed from canRxTask → oledTask ─ */
@@ -53,7 +51,21 @@ typedef struct {
 /* ── Shared handles ────────────────────────── */
 static QueueHandle_t oledQueue = NULL;
 static u8g2_t u8g2;
-static volatile uint8_t g_tx_counter = 0;
+static volatile uint8_t  g_tx_counter = 0;
+
+/* ── Latest IMU values (updated by canRxTask) ─ */
+static volatile int16_t g_ax = 0, g_ay = 0, g_az = 0;  /* *100, 0.01g */
+static volatile int16_t g_gx = 0, g_gy = 0, g_gz = 0;  /* *10, 0.1dps */
+
+/* ── Per-CAN-ID counters (updated by canRxTask) ─ */
+static volatile uint32_t g_n_total    = 0;
+static volatile uint32_t g_n_accel    = 0;  /* 0x211 */
+static volatile uint32_t g_n_gyro     = 0;  /* 0x213 */
+static volatile uint32_t g_n_telem    = 0;  /* 0x210 */
+static volatile uint32_t g_n_ack      = 0;  /* 0x212 */
+static volatile uint32_t g_n_echo     = 0;  /* 0x200 */
+static volatile uint32_t g_n_other    = 0;
+static volatile uint32_t g_last_other_id = 0;
 
 /* ══════════════════════════════════════════════
  *  canRxTask — Priority 3
@@ -72,17 +84,19 @@ static void canRxTask(void *arg)
             ESP_LOGW(TAG, "[canRx] err: %s", esp_err_to_name(err));
             continue;
         }
+        g_n_total++;
 
-        ESP_LOGI(TAG, "[canRx] ID=0x%03lX len=%d data[0]=0x%02X",
-                 (unsigned long)rx.identifier,
-                 rx.data_length_code,
-                 rx.data_length_code > 0 ? rx.data[0] : 0);
+        ESP_LOGI(TAG, "[canRx] ID=0x%03lX len=%d data=%02X %02X %02X %02X %02X %02X %02X %02X",
+                 (unsigned long)rx.identifier, rx.data_length_code,
+                 rx.data[0], rx.data[1], rx.data[2], rx.data[3],
+                 rx.data[4], rx.data[5], rx.data[6], rx.data[7]);
 
         /* ── Forward teach-and-replay telemetry to WebSocket clients ── */
         char ws_json[128];
         switch (rx.identifier) {
 
         case CAN_ID_TELEMETRY: {  /* 0x210 */
+            g_n_telem++;
             int16_t steps_l = (int16_t)((rx.data[0] << 8) | rx.data[1]);
             int16_t steps_r = (int16_t)((rx.data[2] << 8) | rx.data[3]);
             int16_t heading = (int16_t)((rx.data[4] << 8) | rx.data[5]);
@@ -91,29 +105,58 @@ static void canRxTask(void *arg)
                      "\"steps_l\":%d,\"steps_r\":%d,"
                      "\"heading\":%d,\"mode\":%d,\"last_cp\":%d}",
                      steps_l, steps_r, heading, rx.data[6], rx.data[7]);
-            wifi_ap_ws_broadcast(ws_json);
+            ble_robot_notify(ws_json);
             break;
         }
 
-        case CAN_ID_IMU_DATA: {  /* 0x211 */
+        case CAN_ID_IMU_ACCEL: {  /* 0x211 — accelerometer */
+            g_n_accel++;
             int16_t ax = (int16_t)((rx.data[0] << 8) | rx.data[1]);
             int16_t ay = (int16_t)((rx.data[2] << 8) | rx.data[3]);
-            int16_t gz = (int16_t)((rx.data[4] << 8) | rx.data[5]);
+            int16_t az = (int16_t)((rx.data[4] << 8) | rx.data[5]);
+            g_ax = ax; g_ay = ay; g_az = az;
+            ESP_LOGI(TAG, "[canRx] ACCEL ax=%.2fg ay=%.2fg az=%.2fg",
+                     ax / 100.0f, ay / 100.0f, az / 100.0f);
             snprintf(ws_json, sizeof(ws_json),
-                     "{\"type\":\"imu\",\"ax\":%d,\"ay\":%d,\"gz\":%d}",
-                     ax, ay, gz);
-            wifi_ap_ws_broadcast(ws_json);
+                     "{\"type\":\"accel\",\"ax\":%d,\"ay\":%d,\"az\":%d}",
+                     ax, ay, az);
+            ble_robot_notify(ws_json);
+            break;
+        }
+
+        case CAN_ID_IMU_GYRO: {  /* 0x213 — gyroscope: values in 0.1°/s units (divide by 10 for °/s) */
+            g_n_gyro++;
+            int16_t gx = (int16_t)((rx.data[0] << 8) | rx.data[1]);
+            int16_t gy = (int16_t)((rx.data[2] << 8) | rx.data[3]);
+            int16_t gz = (int16_t)((rx.data[4] << 8) | rx.data[5]);
+            g_gx = gx; g_gy = gy; g_gz = gz;
+            ESP_LOGI(TAG, "[canRx] GYRO  gx=%.1f gy=%.1f gz=%.1f deg/s",
+                     gx / 10.0f, gy / 10.0f, gz / 10.0f);
+            snprintf(ws_json, sizeof(ws_json),
+                     "{\"type\":\"gyro\",\"gx\":%d,\"gy\":%d,\"gz\":%d}",
+                     gx, gy, gz);
+            ble_robot_notify(ws_json);
             break;
         }
 
         case CAN_ID_CP_SAVED_ACK:  /* 0x212 */
+            g_n_ack++;
+            ESP_LOGW(TAG, "[canRx] >>> CP_ACK cp_id=%u result=%u <<<",
+                     rx.data[0], rx.data[1]);
             snprintf(ws_json, sizeof(ws_json),
                      "{\"type\":\"ack\",\"cp_id\":%d,\"result\":%d}",
                      rx.data[0], rx.data[1]);
-            wifi_ap_ws_broadcast(ws_json);
+            ble_robot_notify(ws_json);
+            break;
+
+        case CAN_ID_TEST_ECHO:  /* 0x200 */
+            g_n_echo++;
+            ESP_LOGI(TAG, "[canRx] echo from MCU3");
             break;
 
         default:
+            g_n_other++;
+            g_last_other_id = rx.identifier;
             break;
         }
 
@@ -173,41 +216,34 @@ static void oledTask(void *arg)
     for (;;) {
         BaseType_t got = xQueueReceive(oledQueue, &msg, pdMS_TO_TICKS(1000));
 
+        if (got == pdTRUE) rx_count++;
+
         u8g2_ClearBuffer(&u8g2);
         u8g2_SetFont(&u8g2, u8g2_font_6x10_tr);
 
-        /* Header */
-        u8g2_DrawStr(&u8g2, 0, 10, "CAN Test MCU1<->MCU3");
+        /* Row 1: header */
+        u8g2_DrawStr(&u8g2, 0, 10, "MCU1  BMI160 via CAN");
         u8g2_DrawHLine(&u8g2, 0, 12, 128);
 
         char line[32];
 
-        /* TX line — always shows latest ping counter */
-        snprintf(line, sizeof(line), "TX>0x100  cnt:%d",
-                 (int)g_tx_counter);
+        /* Row 2: Accel */
+        snprintf(line, sizeof(line), "A %+.2f %+.2f %+.2fg",
+                 g_ax / 100.0f, g_ay / 100.0f, g_az / 100.0f);
         u8g2_DrawStr(&u8g2, 0, 24, line);
 
-        if (got == pdTRUE) {
-            rx_count++;
+        /* Row 3: Gyro */
+        snprintf(line, sizeof(line), "G %+.2f %+.2f %+.2fd",
+                 g_gx / 100.0f, g_gy / 100.0f, g_gz / 100.0f);
+        u8g2_DrawStr(&u8g2, 0, 36, line);
 
-            snprintf(line, sizeof(line), "RX<0x%03lX d:%02X %02X",
-                     (unsigned long)msg.can_id,
-                     msg.data[0], msg.data[1]);
-            u8g2_DrawStr(&u8g2, 0, 38, line);
+        /* Row 4: TX ping counter */
+        snprintf(line, sizeof(line), "TX 0x100 cnt:%d", (int)g_tx_counter);
+        u8g2_DrawStr(&u8g2, 0, 50, line);
 
-            snprintf(line, sizeof(line), "   %02X %02X %02X %02X",
-                     msg.data[2], msg.data[3], msg.data[4], msg.data[5]);
-            u8g2_DrawStr(&u8g2, 0, 50, line);
-
-            snprintf(line, sizeof(line), "RX total:%lu",
-                     (unsigned long)rx_count);
-            u8g2_DrawStr(&u8g2, 0, 62, line);
-        } else {
-            u8g2_DrawStr(&u8g2, 0, 38, "RX: waiting...");
-            snprintf(line, sizeof(line), "RX total:%lu",
-                     (unsigned long)rx_count);
-            u8g2_DrawStr(&u8g2, 0, 62, line);
-        }
+        /* Row 5: RX frame count */
+        snprintf(line, sizeof(line), "RX frames:%lu", (unsigned long)rx_count);
+        u8g2_DrawStr(&u8g2, 0, 62, line);
 
         u8g2_SendBuffer(&u8g2);
     }
@@ -223,8 +259,12 @@ static void canAlertTask(void *arg)
     uint32_t alerts;
     twai_status_info_t status;
 
-    /* Enable all alerts so we can see what's happening */
-    twai_reconfigure_alerts(TWAI_ALERT_ALL, NULL);
+    /* Enable error/state alerts only — exclude RX_DATA to avoid per-frame spam */
+    twai_reconfigure_alerts(
+        TWAI_ALERT_BUS_OFF | TWAI_ALERT_ERR_PASS | TWAI_ALERT_BUS_ERROR |
+        TWAI_ALERT_TX_FAILED | TWAI_ALERT_RX_QUEUE_FULL |
+        TWAI_ALERT_ABOVE_ERR_WARN | TWAI_ALERT_ARB_LOST,
+        NULL);
 
     for (;;) {
         if (twai_read_alerts(&alerts, pdMS_TO_TICKS(5000)) == ESP_OK) {
@@ -256,6 +296,40 @@ static void canAlertTask(void *arg)
                      (unsigned long)status.tx_failed_count,
                      (unsigned long)status.rx_missed_count);
         }
+    }
+}
+
+/* ══════════════════════════════════════════════
+ *  statsTask — every 3 seconds dump everything
+ * ═════════════════════════════════════════════ */
+static void statsTask(void *arg)
+{
+    (void)arg;
+    twai_status_info_t st;
+    uint32_t prev_total = 0, prev_accel = 0, prev_gyro = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        twai_get_status_info(&st);
+        uint32_t d_total = g_n_total - prev_total;
+        uint32_t d_accel = g_n_accel - prev_accel;
+        uint32_t d_gyro  = g_n_gyro  - prev_gyro;
+        prev_total = g_n_total; prev_accel = g_n_accel; prev_gyro = g_n_gyro;
+
+        ESP_LOGW(TAG,
+            "=== STATS ===  RX total=%lu (+%lu/3s)  accel=%lu (+%lu)  gyro=%lu (+%lu)  telem=%lu  ack=%lu  echo=%lu  other=%lu(last=0x%lX)",
+            g_n_total, d_total, g_n_accel, d_accel, g_n_gyro, d_gyro,
+            g_n_telem, g_n_ack, g_n_echo, g_n_other, g_last_other_id);
+        ESP_LOGW(TAG, "=== STATS ===  BLE connected=%d",
+            (int)ble_robot_connected());
+        ESP_LOGW(TAG,
+            "=== STATS ===  TWAI state=%d  tx_err=%lu  rx_err=%lu  tx_fail=%lu  rx_miss=%lu  rx_qlen=%lu  msgs_to_tx=%lu",
+            st.state, st.tx_error_counter, st.rx_error_counter,
+            st.tx_failed_count, st.rx_missed_count,
+            st.msgs_to_rx, st.msgs_to_tx);
+        ESP_LOGW(TAG,
+            "=== STATS ===  IMU latest A=%d,%d,%d  G=%d,%d,%d  free_heap=%lu",
+            g_ax, g_ay, g_az, g_gx, g_gy, g_gz,
+            (unsigned long)esp_get_free_heap_size());
     }
 }
 
@@ -331,25 +405,22 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_ret);
 
-    /* TCP/IP stack + default event loop (required by WiFi) */
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-
     oled_init();
     vTaskDelay(pdMS_TO_TICKS(500));
 
     ESP_ERROR_CHECK(can_init());
 
-    /* Start WiFi AP + WebSocket server */
-    ESP_ERROR_CHECK(wifi_ap_ws_init());
+    /* Start BLE GATT peripheral */
+    ESP_ERROR_CHECK(ble_robot_init());
 
     oledQueue = xQueueCreate(1, sizeof(oled_msg_t));
     configASSERT(oledQueue);
 
     xTaskCreate(canRxTask,    "canRx",    4096, NULL, 3, NULL);
-    xTaskCreate(canTxTask,    "canTx",    2048, NULL, 2, NULL);
+    /* canTxTask removed — was sending unnecessary 0x100 test pings to MCU3 */
     xTaskCreate(oledTask,     "oled",     4096, NULL, 1, NULL);
     xTaskCreate(canAlertTask, "canAlert", 2048, NULL, 1, NULL);
+    xTaskCreate(statsTask,    "stats",    3072, NULL, 1, NULL);
 
     ESP_LOGI(TAG, "All tasks created");
 }
