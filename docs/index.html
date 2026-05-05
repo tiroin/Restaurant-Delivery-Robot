@@ -903,13 +903,15 @@ function toggleRecord() {
    constant and the only control variable is time.
 ═══════════════════════════════════════════════════════════════════════ */
 
-/* Drive direction `dir` for `ms` milliseconds (or `stepsTarget` hardware steps if >=50),
+/* Drive direction `dir` for `ms` milliseconds (or `stepsTarget` hardware steps if >=200),
    then call onDone(lag_ms). */
 function driveFor(dir, ms, onDone, stepsTarget) {
   /* ── STEP-COUNT CLOSED-LOOP MODE ──
-     MCU2 counts steps in hardware and self-stops; browser waits for odo ACK.
-     Immune to setTimeout jitter. Watchdog fires at 2×ms+2s if BLE drops. */
-  if (stepsTarget >= 50) {
+     MCU2 threshold = 200 (STEP_COUNT_THRESHOLD). When cmd.steps >= 200, MCU2
+     enters step-count mode: ISR self-stops at target and sends CAN 0x214 odo frame.
+     Browser waits for that odo ACK instead of using setTimeout.
+     Watchdog fires at 2×ms+2s if BLE drops. */
+  if (stepsTarget >= 200) {
     dbgEvent('driveFor-steps', ['FWD','BWD','LEFT','RIGHT'][dir] + ' target=' + stepsTarget + ' steps');
     send({cmd:'move', dir:dir, steps:stepsTarget});
     var wdg = setTimeout(function() {
@@ -989,7 +991,7 @@ function doReplay(segments, onDone) {
     setSt('Replay ' + i + '/' + segments.length +
           '  dir=' + ['FWD','BWD','LEFT','RIGHT'][seg.dir] +
           '  ' + adjDur + 'ms' + (prevLag > 5 ? ' (adj -'+prevLag+'ms)' : ''));
-    driveFor(seg.dir, adjDur, next);
+    driveFor(seg.dir, adjDur, next, seg.steps || 0);
   }
   next(0);
 }
