@@ -665,21 +665,25 @@ var currentRec = [];
 var rSeg       = { dir:-1 };
 var pendingOdoSeg = -1;   /* tripLog index awaiting hardware step-count update */
 var pendingOdoCb  = null; /* callback(steps) waiting for odo ACK during step-count replay */
+var pendingOdoDir = -1;   /* dir expected by pendingOdoCb; odo with different dir is discarded */
+var pendingOdoSeq = 0;    /* monotonic token; stale odo closures self-discard on mismatch */
 
 /* Called when CAN 0x214 odometry frame arrives from MCU2. */
 function onOdometry(dir, s1, s2) {
   var steps = Math.round((s1 + s2) / 2);
   var hasCb = !!pendingOdoCb;
-  dbgEvent('odo', _DN[dir]+' s1='+s1+' s2='+s2+' avg='+steps+(hasCb ? ' CB✓' : ' NO-CB!'), hasCb ? 'G' : 'W');
+  var dirMatch = (pendingOdoDir < 0 || pendingOdoDir === dir);
+  dbgEvent('odo', _DN[dir]+' s1='+s1+' s2='+s2+' avg='+steps+(hasCb ? (dirMatch ? ' CB✓' : ' DIR-MISMATCH(exp '+_DN[pendingOdoDir]+')') : ' NO-CB!'), (hasCb && dirMatch) ? 'G' : 'W');
   /* Update last recorded segment with actual hardware step count */
   if (pendingOdoSeg >= 0 && pendingOdoSeg < tripLog.length) {
     tripLog[pendingOdoSeg].steps = steps;
     pendingOdoSeg = -1;
   }
-  /* Resolve pending replay step-count callback */
-  if (pendingOdoCb) {
+  /* Resolve pending replay step-count callback — only if direction matches */
+  if (pendingOdoCb && dirMatch) {
     var cb = pendingOdoCb;
     pendingOdoCb = null;
+    pendingOdoDir = -1;
     cb(steps);
   }
 }
@@ -914,18 +918,25 @@ function driveFor(dir, ms, onDone, stepsTarget) {
      Watchdog fires at 2×ms+2s if BLE drops. */
   if (stepsTarget >= 200) {
     var _scStart = Date.now();
-    dbgEvent('SC-start', _DN[dir]+' tgt='+stepsTarget+' exp='+ms+'ms', 'G');
+    var _mySeq = ++pendingOdoSeq;
+    dbgEvent('SC-start', _DN[dir]+' tgt='+stepsTarget+' exp='+ms+'ms seq='+_mySeq, 'G');
     send({cmd:'move', dir:dir, steps:stepsTarget});
     var wdg = setTimeout(function() {
-      if (!pendingOdoCb) return;
+      if (pendingOdoSeq !== _mySeq || !pendingOdoCb) return; /* already resolved */
       pendingOdoCb = null;
+      pendingOdoDir = -1;
       var _wdgMs = Date.now() - _scStart;
       dbgEvent('SC-WDG', _DN[dir]+' NO ODO after '+_wdgMs+'ms (exp '+ms+'ms)', 'E');
       send({cmd:'stop'});
       applyTime(dir, ms);
       setTimeout(function() { onDone(0); }, 100);
     }, ms * 2 + 2000);
+    pendingOdoDir = dir;
     pendingOdoCb = function(steps) {
+      if (pendingOdoSeq !== _mySeq) {
+        dbgEvent('SC-stale-cb', _DN[dir]+' seq='+_mySeq+' cur='+pendingOdoSeq+' DISCARDED', 'W');
+        return;
+      }
       clearTimeout(wdg);
       var _scMs = Date.now() - _scStart;
       dbgEvent('SC-odo-cb', _DN[dir]+' steps='+steps+' actual='+_scMs+'ms exp='+ms+'ms', 'G');
