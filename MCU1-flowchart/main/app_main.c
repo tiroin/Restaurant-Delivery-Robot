@@ -149,6 +149,18 @@ static void canRxTask(void *arg)
             ble_robot_notify(ws_json);
             break;
 
+        case CAN_ID_ODOMETRY: {  /* 0x214 — hardware step count on segment end */
+            uint8_t  odo_dir = rx.data[0];
+            uint16_t s1 = (uint16_t)((rx.data[1] << 8) | rx.data[2]);
+            uint16_t s2 = (uint16_t)((rx.data[3] << 8) | rx.data[4]);
+            ESP_LOGI(TAG, "[canRx] ODO  dir=%u s1=%u s2=%u", odo_dir, s1, s2);
+            snprintf(ws_json, sizeof(ws_json),
+                     "{\"type\":\"odo\",\"dir\":%d,\"s1\":%d,\"s2\":%d}",
+                     odo_dir, s1, s2);
+            ble_robot_notify(ws_json);
+            break;
+        }
+
         case CAN_ID_TEST_ECHO:  /* 0x200 */
             g_n_echo++;
             ESP_LOGI(TAG, "[canRx] echo from MCU3");

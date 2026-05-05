@@ -168,18 +168,34 @@ typedef struct {
  */
 #define CAN_ID_TELEMETRY        0x210U
 
-/** IMU data snapshot (every 200 ms in LEARN/AUTO mode).
- *  data[0:1] = accel_x × 100  int16 big-endian
- *  data[2:3] = accel_y × 100  int16 big-endian
- *  data[4:5] = gyro_z  × 10   int16 big-endian
+/** IMU accelerometer frame (every 200 ms).
+ *  data[0:1] = accel_x × 100  int16 big-endian  (0.01 g)
+ *  data[2:3] = accel_y × 100  int16 big-endian  (0.01 g)
+ *  data[4:5] = accel_z × 100  int16 big-endian  (0.01 g)
  */
-#define CAN_ID_IMU_DATA         0x211U
+#define CAN_ID_IMU_ACCEL        0x211U
+
+/** IMU gyroscope frame (every 200 ms).
+ *  data[0:1] = gyro_x × 100   int16 big-endian  (0.01 dps)
+ *  data[2:3] = gyro_y × 100   int16 big-endian  (0.01 dps)
+ *  data[4:5] = gyro_z × 100   int16 big-endian  (0.01 dps)
+ */
+#define CAN_ID_IMU_GYRO         0x213U
 
 /** Acknowledgment after a SAVE_CP command.
  *  data[0] = checkpoint_id
  *  data[1] = result  (0 = OK, 1 = FAIL)
  */
 #define CAN_ID_CP_SAVED_ACK     0x212U
+
+/** Odometry frame — sent by MCU2 when a motor segment ends.
+ *  Sent on: explicit stop command, step-count target reached, or 300 ms timeout.
+ *  data[0]   = last direction (0=FWD 1=BWD 2=LEFT 3=RIGHT)
+ *  data[1:2] = motor1_steps  uint16 big-endian  (full steps since last start)
+ *  data[3:4] = motor2_steps  uint16 big-endian
+ *  data[5:6] = HAL_GetTick() & 0xFFFF  uint16 big-endian  (ms timestamp, wraps)
+ */
+#define CAN_ID_ODOMETRY         0x214U
 
 /* MCU2 operating modes (used in CAN_ID_SET_MODE and CAN_ID_TELEMETRY) */
 #define MCU2_MODE_IDLE          0x00U
