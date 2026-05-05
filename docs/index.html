@@ -907,9 +907,11 @@ function toggleRecord() {
    then call onDone(lag_ms). */
 function driveFor(dir, ms, onDone, stepsTarget) {
   /* ── STEP-COUNT CLOSED-LOOP MODE ──
-     MCU2 counts steps in hardware and self-stops; browser waits for odo ACK.
-     Immune to setTimeout jitter. Watchdog fires at 2×ms+2s if BLE drops. */
-  if (stepsTarget >= 50) {
+     Only for FWD/BWD: MCU2 counts steps in hardware and self-stops; browser
+     waits for odo ACK. Immune to setTimeout jitter.
+     Turns (LEFT/RIGHT) always use time-based mode because "steps" does not
+     represent angle — angle depends on PIVOT_DEG_PER_MS, not step count. */
+  if (stepsTarget >= 50 && (dir === 0 || dir === 1)) {
     dbgEvent('driveFor-steps', ['FWD','BWD','LEFT','RIGHT'][dir] + ' target=' + stepsTarget + ' steps');
     send({cmd:'move', dir:dir, steps:stepsTarget});
     var wdg = setTimeout(function() {
