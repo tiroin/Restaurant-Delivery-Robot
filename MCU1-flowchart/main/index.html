@@ -147,6 +147,38 @@ select.rsel{width:100%;padding:7px 9px;border:1.5px solid #e0e0e0;border-radius:
   <div id="recinfo">Auto-tracking trip from page load</div>
 </div>
 
+<!-- DELIVERY GRAPH (multi-table routing) -->
+<div class="card" id="graphCard">
+  <div class="card-title dbg-hdr">
+    Delivery Graph
+    <span style="display:flex;gap:6px;flex-wrap:wrap">
+      <button class="minibtn" onclick="rebuildGraphUI()">&#8635; Refresh</button>
+      <button class="minibtn" id="ghToggleBtn" onclick="toggleGraphPanel()">Hide</button>
+    </span>
+  </div>
+  <div id="graphBody">
+    <div class="rbrow" style="margin-bottom:6px">
+      <button class="rbtn" onclick="recordEdge()" id="recEdgeBtn">&#9899; Record Edge</button>
+      <button class="rbtn" onclick="addNode()">&#43; Node</button>
+    </div>
+
+    <div style="font-size:.65rem;color:#666;margin:4px 0 3px">Nodes &nbsp;<span style="color:#999">(tap to change type)</span></div>
+    <div id="nodeList" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px"></div>
+
+    <div style="font-size:.65rem;color:#666;margin:4px 0 3px">Edges</div>
+    <div id="edgeList" style="font-size:.6rem;color:#555;margin-bottom:6px;max-height:70px;overflow-y:auto;background:#fafafa;border-radius:6px;padding:4px 6px"></div>
+
+    <div style="font-size:.65rem;color:#666;margin:6px 0 3px">Order: pick delivery tables</div>
+    <div id="orderSel" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px"></div>
+
+    <div class="rbrow">
+      <button class="rbtn GO"   onclick="planAndDeliver()" id="delvBtn">&#9654; Plan + Deliver</button>
+      <button class="rbtn R"    onclick="cancelDelivery()" id="cancelDelvBtn">&#10005; Cancel</button>
+    </div>
+    <div id="planInfo" style="font-size:.6rem;color:#444;margin-top:6px;white-space:pre-wrap;background:#f5f5f7;border-radius:6px;padding:5px 7px;min-height:18px">Pick tables and click Plan + Deliver</div>
+  </div>
+</div>
+
 <!-- DEBUG PANEL -->
 <div class="card" id="dbgCard">
   <div class="card-title dbg-hdr">
@@ -866,6 +898,7 @@ function saveRoute(name, arr) {
   routes[name] = arr;
   localStorage.setItem('rroutes', JSON.stringify(routes));
   rebuildSel(); selByName(name); updateInfo();
+  if (typeof rebuildGraphUI === 'function') rebuildGraphUI();
 }
 function rebuildSel() {
   var sel = document.getElementById('routeSel');
@@ -897,6 +930,7 @@ function deleteRoute() {
   delete routes[name];
   localStorage.setItem('rroutes', JSON.stringify(routes));
   rebuildSel();
+  if (typeof rebuildGraphUI === 'function') rebuildGraphUI();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -913,7 +947,11 @@ function toggleRecord() {
   } else {
     btn.textContent = '⏺ Record'; btn.className = 'rbtn';
     if (currentRec.length===0) { setSt('Nothing recorded'); updateInfo(); return; }
-    var name = prompt('Save route as:', 'Route'+(Object.keys(routes).length+1));
+    /* If the graph editor pre-set an edge name, use it without prompting. */
+    var name = (typeof _pendingEdgeName === 'string' && _pendingEdgeName)
+      ? _pendingEdgeName
+      : prompt('Save route as:', 'Route'+(Object.keys(routes).length+1));
+    _pendingEdgeName = null;
     if (name && name.trim()) {
       saveRoute(name.trim(), currentRec.slice());
       setSt('Saved "'+name.trim()+'" ('+currentRec.length+' segs)');
@@ -1072,6 +1110,416 @@ function returnHome() {
     setSt('Home ✓  (drive completed — tap "Mark Home" if position is confirmed)');
     updateInfo();
   });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MULTI-TABLE DELIVERY: Checkpoint graph + Dijkstra + TSP
+   ─────────────────────────────────────────────────────────────────────
+   Convention: a route saved with name "From->To" is a directed edge.
+   Nodes are derived from edge names + an explicit nodes list (gnodes).
+   Each node has a type: "start" (kitchen), "table", or "junction".
+   Reverse edges are auto-derived from forward edges (FLIP'd dirs +
+   reversed segment order) — same trick as returnHome().
+   Tour planning: Dijkstra all-pairs steps cost; TSP brute-force ≤8
+   tables, nearest-neighbour + 2-opt above.  Pause for "unloaded"
+   confirmation when arriving at any "table" node.
+═══════════════════════════════════════════════════════════════════════ */
+var _pendingEdgeName = null;     /* set by recordEdge(); consumed in toggleRecord */
+var gnodes = {};                 /* { "Kitchen":"start", "T1":"table", ... } */
+var _nodeTypes = ['start','table','junction'];
+var _delivery = null;            /* active delivery state {tour, idx, abort} */
+
+function loadGraph() {
+  try { gnodes = JSON.parse(localStorage.getItem('gnodes')||'{}'); }
+  catch(e){ gnodes = {}; }
+}
+function saveGraph() { localStorage.setItem('gnodes', JSON.stringify(gnodes)); }
+
+/* Parse a route name "A->B" into [from, to], or null if not edge-shaped. */
+function parseEdgeName(name) {
+  var m = String(name||'').split('->');
+  if (m.length !== 2) return null;
+  var a = m[0].trim(), b = m[1].trim();
+  if (!a || !b || a === b) return null;
+  return [a, b];
+}
+
+/* Collect graph state from `routes` + `gnodes`. Returns
+   { nodes:[names], edges:{from:{to:{segs,cost}}} } with reverses synthesised. */
+function buildGraph() {
+  var edges = {};
+  var nodeSet = {};
+  Object.keys(gnodes).forEach(function(n){ nodeSet[n] = true; });
+
+  function addEdge(from, to, segs) {
+    nodeSet[from] = true; nodeSet[to] = true;
+    var cost = 0;
+    for (var i=0;i<segs.length;i++) cost += (segs[i].steps || segs[i].dur || 0);
+    if (!edges[from]) edges[from] = {};
+    /* forward overrides synthesised reverse */
+    edges[from][to] = { segs: segs, cost: cost, synth: false };
+  }
+  function addSynthReverse(from, to, segs) {
+    if (edges[to] && edges[to][from] && !edges[to][from].synth) return;  /* real edge wins */
+    var rev = segs.slice().reverse().map(function(s){
+      return { dir: FLIP[s.dir], dur: s.dur, steps: s.steps || 0 };
+    });
+    var cost = 0;
+    for (var i=0;i<rev.length;i++) cost += (rev[i].steps || rev[i].dur || 0);
+    if (!edges[to]) edges[to] = {};
+    edges[to][from] = { segs: rev, cost: cost, synth: true };
+  }
+
+  Object.keys(routes).forEach(function(name){
+    var p = parseEdgeName(name);
+    if (!p) return;
+    var segs = routes[name];
+    if (!segs || !segs.length) return;
+    addEdge(p[0], p[1], segs);
+  });
+  /* second pass: synthesise reverses where forward edge exists but reverse doesn't */
+  Object.keys(routes).forEach(function(name){
+    var p = parseEdgeName(name);
+    if (!p) return;
+    var segs = routes[name];
+    if (!segs || !segs.length) return;
+    addSynthReverse(p[0], p[1], segs);
+  });
+
+  return { nodes: Object.keys(nodeSet).sort(), edges: edges };
+}
+
+/* Dijkstra from `src` over graph `g`. Returns { dist:{n:cost}, prev:{n:nodename} }. */
+function dijkstra(g, src) {
+  var dist = {}, prev = {}, visited = {};
+  g.nodes.forEach(function(n){ dist[n] = Infinity; });
+  dist[src] = 0;
+  while (true) {
+    /* simple O(V^2) — fine for restaurant-scale graphs */
+    var u = null, best = Infinity;
+    for (var i=0;i<g.nodes.length;i++) {
+      var n = g.nodes[i];
+      if (!visited[n] && dist[n] < best) { best = dist[n]; u = n; }
+    }
+    if (u === null) break;
+    visited[u] = true;
+    var neigh = g.edges[u] || {};
+    Object.keys(neigh).forEach(function(v){
+      var alt = dist[u] + neigh[v].cost;
+      if (alt < dist[v]) { dist[v] = alt; prev[v] = u; }
+    });
+  }
+  return { dist: dist, prev: prev };
+}
+
+/* Reconstruct path of node names from src to dst using prev map. */
+function pathFromPrev(prev, src, dst) {
+  var path = [dst], cur = dst;
+  while (cur !== src) {
+    if (!(cur in prev)) return null;  /* unreachable */
+    cur = prev[cur];
+    path.push(cur);
+  }
+  return path.reverse();
+}
+
+/* TSP: visit start → all of `tables` (any order) → start. Returns optimal
+   ordering of tables (array of names). Brute-forces if ≤8 tables, else
+   uses nearest-neighbour + 2-opt. */
+function planTour(g, start, tables) {
+  if (!tables.length) return { order: [], cost: 0 };
+  /* all-pairs dist via Dijkstra from each relevant node */
+  var nodes = [start].concat(tables);
+  var dist = {};
+  for (var i=0;i<nodes.length;i++) {
+    var r = dijkstra(g, nodes[i]);
+    dist[nodes[i]] = r.dist;
+    /* check reachability */
+    for (var j=0;j<nodes.length;j++) {
+      if (i!==j && !isFinite(r.dist[nodes[j]])) {
+        return { error: 'No path from "'+nodes[i]+'" to "'+nodes[j]+'"' };
+      }
+    }
+  }
+  function tourCost(order) {
+    var c = dist[start][order[0]];
+    for (var k=0;k<order.length-1;k++) c += dist[order[k]][order[k+1]];
+    c += dist[order[order.length-1]][start];
+    return c;
+  }
+  if (tables.length <= 8) {
+    /* brute-force all permutations */
+    var best = null, bestCost = Infinity;
+    function perm(arr, k) {
+      if (k === arr.length-1) {
+        var c = tourCost(arr);
+        if (c < bestCost) { bestCost = c; best = arr.slice(); }
+        return;
+      }
+      for (var i=k;i<arr.length;i++) {
+        var t = arr[k]; arr[k] = arr[i]; arr[i] = t;
+        perm(arr, k+1);
+        t = arr[k]; arr[k] = arr[i]; arr[i] = t;
+      }
+    }
+    perm(tables.slice(), 0);
+    return { order: best, cost: bestCost };
+  } else {
+    /* nearest-neighbour from start */
+    var unv = tables.slice(), order = [], cur = start;
+    while (unv.length) {
+      var bi = 0, bd = dist[cur][unv[0]];
+      for (var i=1;i<unv.length;i++) if (dist[cur][unv[i]] < bd) { bd = dist[cur][unv[i]]; bi = i; }
+      order.push(unv[bi]); cur = unv[bi]; unv.splice(bi,1);
+    }
+    /* 2-opt */
+    var improved = true, iter = 0;
+    while (improved && iter++ < 200) {
+      improved = false;
+      for (var i=0;i<order.length-1;i++) {
+        for (var j=i+1;j<order.length;j++) {
+          var a = i===0 ? start : order[i-1];
+          var b = order[i];
+          var c = order[j];
+          var d = j===order.length-1 ? start : order[j+1];
+          var d1 = dist[a][b] + dist[c][d];
+          var d2 = dist[a][c] + dist[b][d];
+          if (d2 + 1 < d1) {
+            /* reverse segment i..j */
+            order = order.slice(0,i)
+                   .concat(order.slice(i,j+1).reverse())
+                   .concat(order.slice(j+1));
+            improved = true;
+          }
+        }
+      }
+    }
+    return { order: order, cost: tourCost(order) };
+  }
+}
+
+/* Concatenate edges along a sequence of nodes [n0,n1,n2,...] into one
+   segments array, plus a parallel array of "arrived" node names per edge. */
+function concatPath(g, nodeSeq) {
+  var segs = [], arrived = [];
+  for (var i=0;i<nodeSeq.length-1;i++) {
+    var e = (g.edges[nodeSeq[i]]||{})[nodeSeq[i+1]];
+    if (!e) return null;
+    segs.push({ _edge: nodeSeq[i]+'->'+nodeSeq[i+1], _segs: e.segs, _to: nodeSeq[i+1] });
+  }
+  return segs;
+}
+
+/* ── UI ─────────────────────────────────────────────────────────────── */
+
+function rebuildGraphUI() {
+  var g = buildGraph();
+  /* ensure every observed node has a gnodes entry */
+  var changed = false;
+  g.nodes.forEach(function(n){
+    if (!(n in gnodes)) {
+      gnodes[n] = (n.toLowerCase().indexOf('kitchen') >= 0) ? 'start'
+                 : (/^t\d+$/i.test(n) ? 'table' : 'junction');
+      changed = true;
+    }
+  });
+  if (changed) saveGraph();
+
+  /* Node chips */
+  var nodeListEl = document.getElementById('nodeList');
+  if (nodeListEl) {
+    if (g.nodes.length === 0) {
+      nodeListEl.innerHTML = '<span style="font-size:.6rem;color:#999">No nodes yet — record an edge "Kitchen-&gt;T1" or click + Node.</span>';
+    } else {
+      nodeListEl.innerHTML = g.nodes.map(function(n){
+        var t = gnodes[n] || 'junction';
+        var color = t==='start' ? '#1a73e8' : t==='table' ? '#34a853' : '#777';
+        var bg    = t==='start' ? '#e8f0fe' : t==='table' ? '#e8f5e9' : '#f1f3f4';
+        return '<span class="gnode" data-n="'+n+'" '+
+               'style="cursor:pointer;font-size:.62rem;padding:3px 8px;border-radius:8px;'+
+               'background:'+bg+';color:'+color+';border:1px solid '+color+'33">'+
+               n+' <span style="opacity:.7">['+t+']</span></span>';
+      }).join('');
+      Array.prototype.forEach.call(nodeListEl.querySelectorAll('.gnode'), function(el){
+        el.onclick = function(){
+          var n = el.getAttribute('data-n');
+          var idx = _nodeTypes.indexOf(gnodes[n]||'junction');
+          /* cycle: junction → start → table → junction; only one start allowed */
+          var nx = _nodeTypes[(idx+1) % _nodeTypes.length];
+          if (nx === 'start') {
+            Object.keys(gnodes).forEach(function(k){ if (gnodes[k]==='start' && k!==n) gnodes[k]='junction'; });
+          }
+          gnodes[n] = nx;
+          saveGraph();
+          rebuildGraphUI();
+        };
+      });
+    }
+  }
+
+  /* Edge list */
+  var edgeListEl = document.getElementById('edgeList');
+  if (edgeListEl) {
+    var lines = [];
+    Object.keys(g.edges).sort().forEach(function(from){
+      Object.keys(g.edges[from]).sort().forEach(function(to){
+        var e = g.edges[from][to];
+        lines.push((e.synth?'⇠ ':'→ ') + from + ' → ' + to + '   ' + e.segs.length + ' seg, ' + Math.round(e.cost) + (e.synth?' [auto-rev]':''));
+      });
+    });
+    edgeListEl.innerHTML = lines.length ? lines.join('<br>') : '<i>No edges. Record one with "Record Edge".</i>';
+  }
+
+  /* Order picker — show table nodes only */
+  var orderEl = document.getElementById('orderSel');
+  if (orderEl) {
+    var tables = g.nodes.filter(function(n){ return gnodes[n]==='table'; });
+    if (tables.length === 0) {
+      orderEl.innerHTML = '<span style="font-size:.6rem;color:#999">Mark at least one node as "table" (tap a chip).</span>';
+    } else {
+      orderEl.innerHTML = tables.map(function(n){
+        var checked = (_orderPick[n] ? 'checked' : '');
+        return '<label style="display:flex;align-items:center;gap:3px;font-size:.65rem;background:#f5f5f7;padding:4px 8px;border-radius:7px;cursor:pointer">'+
+               '<input type="checkbox" data-n="'+n+'" '+checked+'> '+n+'</label>';
+      }).join('');
+      Array.prototype.forEach.call(orderEl.querySelectorAll('input'), function(cb){
+        cb.onchange = function(){ _orderPick[cb.getAttribute('data-n')] = cb.checked; };
+      });
+    }
+  }
+}
+var _orderPick = {};
+
+function addNode() {
+  var name = prompt('New node name (e.g. "T4", "Hall", "Kitchen"):', '');
+  if (!name) return;
+  name = name.trim();
+  if (!name || name.indexOf('->') >= 0) { alert('Invalid name'); return; }
+  if (gnodes[name]) { alert('Already exists'); return; }
+  gnodes[name] = (name.toLowerCase().indexOf('kitchen')>=0) ? 'start'
+               : (/^t\d+$/i.test(name) ? 'table' : 'junction');
+  saveGraph();
+  rebuildGraphUI();
+}
+
+/* Record a new edge: pick from/to, then start recording.  Sets
+   _pendingEdgeName so toggleRecord saves under "From->To". */
+function recordEdge() {
+  if (recording || replaying) { setSt('Stop current op first'); return; }
+  var g = buildGraph();
+  var nodeNames = g.nodes.length ? g.nodes : ['Kitchen'];
+  var from = prompt('Edge FROM node:\n('+nodeNames.join(', ')+')', nodeNames[0]||'Kitchen');
+  if (!from) return;
+  from = from.trim();
+  var to = prompt('Edge TO node:\n('+nodeNames.join(', ')+')', nodeNames[1]||'T1');
+  if (!to) return;
+  to = to.trim();
+  if (!from || !to || from === to) { alert('Invalid endpoints'); return; }
+  /* register nodes if new */
+  if (!gnodes[from]) gnodes[from] = (from.toLowerCase().indexOf('kitchen')>=0?'start':(/^t\d+$/i.test(from)?'table':'junction'));
+  if (!gnodes[to])   gnodes[to]   = (to.toLowerCase().indexOf('kitchen')>=0?'start':(/^t\d+$/i.test(to)?'table':'junction'));
+  saveGraph();
+  _pendingEdgeName = from + '->' + to;
+  setSt('● Recording edge "'+_pendingEdgeName+'" — drive then click Stop Rec');
+  /* start recording programmatically */
+  if (!recording) toggleRecord();
+}
+
+function toggleGraphPanel() {
+  var body = document.getElementById('graphBody');
+  var btn  = document.getElementById('ghToggleBtn');
+  if (!body || !btn) return;
+  if (body.style.display === 'none') { body.style.display = ''; btn.textContent = 'Hide'; }
+  else                                { body.style.display = 'none'; btn.textContent = 'Show'; }
+}
+
+/* ── Delivery executor ──────────────────────────────────────────────── */
+
+function planAndDeliver() {
+  if (recording) { setSt('Stop recording first'); return; }
+  if (replaying) { setSt('Replay in progress'); return; }
+  if (_delivery) { setSt('Delivery already running'); return; }
+
+  var g = buildGraph();
+  var start = null;
+  Object.keys(gnodes).forEach(function(n){ if (gnodes[n]==='start') start = n; });
+  if (!start) { alert('Mark one node as "start" (tap a chip until it shows [start]).'); return; }
+
+  var picked = Object.keys(_orderPick).filter(function(n){ return _orderPick[n] && gnodes[n]==='table'; });
+  if (picked.length === 0) { alert('Pick at least one delivery table.'); return; }
+
+  var plan = planTour(g, start, picked);
+  if (plan.error) { alert('Planning failed: '+plan.error); return; }
+
+  /* full node sequence: start → table1 → table2 → … → start */
+  var nodeSeq = [start].concat(plan.order).concat([start]);
+  var legs = [];   /* [{from,to,segs,isDelivery}] */
+  for (var i=0;i<nodeSeq.length-1;i++) {
+    var e = (g.edges[nodeSeq[i]]||{})[nodeSeq[i+1]];
+    if (!e) {
+      /* path may need intermediate junction nodes — solve with Dijkstra */
+      var dj = dijkstra(g, nodeSeq[i]);
+      var sub = pathFromPrev(dj.prev, nodeSeq[i], nodeSeq[i+1]);
+      if (!sub) { alert('No path from '+nodeSeq[i]+' to '+nodeSeq[i+1]); return; }
+      for (var k=0;k<sub.length-1;k++) {
+        var ee = (g.edges[sub[k]]||{})[sub[k+1]];
+        legs.push({ from:sub[k], to:sub[k+1], segs:ee.segs,
+                    isDelivery:(k===sub.length-2 && gnodes[sub[k+1]]==='table') });
+      }
+    } else {
+      legs.push({ from:nodeSeq[i], to:nodeSeq[i+1], segs:e.segs,
+                  isDelivery:(gnodes[nodeSeq[i+1]]==='table') });
+    }
+  }
+
+  /* show plan */
+  var summary = 'Tour: ' + nodeSeq.join(' → ') + '\n' +
+                'Total cost ≈ ' + Math.round(plan.cost) + ' steps\n' +
+                'Legs: ' + legs.length;
+  document.getElementById('planInfo').textContent = summary;
+  setSt('Delivering ('+legs.length+' legs)…');
+
+  _delivery = { legs: legs, idx: 0, abort: false };
+  runNextLeg();
+}
+
+function runNextLeg() {
+  if (!_delivery || _delivery.abort) { _delivery = null; return; }
+  var d = _delivery;
+  if (d.idx >= d.legs.length) {
+    setSt('Delivery complete ✓');
+    document.getElementById('planInfo').textContent += '\n✓ All deliveries done';
+    _delivery = null;
+    return;
+  }
+  var leg = d.legs[d.idx];
+  setSt('Leg ' + (d.idx+1) + '/' + d.legs.length + '  ' + leg.from + ' → ' + leg.to);
+  document.getElementById('planInfo').textContent =
+    'Leg ' + (d.idx+1) + '/' + d.legs.length + ': ' + leg.from + ' → ' + leg.to + ' (' + leg.segs.length + ' seg)';
+
+  doReplay(leg.segs.slice(), function() {
+    if (!_delivery || _delivery.abort) { _delivery = null; return; }
+    _delivery.idx++;
+    if (leg.isDelivery) {
+      /* Pause for waiter to unload */
+      setSt('Arrived at ' + leg.to + ' — unload then click OK');
+      setTimeout(function(){
+        var ok = confirm('Arrived at "' + leg.to + '".\n\nClick OK after the food has been unloaded.\n(Cancel = abort delivery.)');
+        if (!ok) { cancelDelivery(); return; }
+        runNextLeg();
+      }, 50);
+    } else {
+      /* Pure transit — small settle then continue */
+      setTimeout(runNextLeg, 200);
+    }
+  });
+}
+
+function cancelDelivery() {
+  if (_delivery) _delivery.abort = true;
+  if (replaying) { replaying = false; stopMove(); setReplayBtn(false); }
+  _delivery = null;
+  setSt('Delivery cancelled');
 }
 
 /* Re-anchor origin to current physical position. */
@@ -1312,6 +1760,8 @@ function toggleDbg() {
 /* ─── boot ─── */
 loadBias();
 loadRoutes();
+loadGraph();
+rebuildGraphUI();
 /* BLE requires a user gesture to call requestDevice() — tap the status bar */
 setSt('Tap the status bar to connect BLE');
 setInterval(refreshDebug, 500);
