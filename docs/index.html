@@ -669,7 +669,8 @@ var pendingOdoCb  = null; /* callback(steps) waiting for odo ACK during step-cou
 /* Called when CAN 0x214 odometry frame arrives from MCU2. */
 function onOdometry(dir, s1, s2) {
   var steps = Math.round((s1 + s2) / 2);
-  dbgEvent('odo', ['FWD','BWD','LEFT','RIGHT'][dir]+' s1='+s1+' s2='+s2);
+  var hasCb = !!pendingOdoCb;
+  dbgEvent('odo', _DN[dir]+' s1='+s1+' s2='+s2+' avg='+steps+(hasCb ? ' CB✓' : ' NO-CB!'), hasCb ? 'G' : 'W');
   /* Update last recorded segment with actual hardware step count */
   if (pendingOdoSeg >= 0 && pendingOdoSeg < tripLog.length) {
     tripLog[pendingOdoSeg].steps = steps;
@@ -912,18 +913,23 @@ function driveFor(dir, ms, onDone, stepsTarget) {
      Browser waits for that odo ACK instead of using setTimeout.
      Watchdog fires at 2×ms+2s if BLE drops. */
   if (stepsTarget >= 200) {
-    dbgEvent('driveFor-steps', ['FWD','BWD','LEFT','RIGHT'][dir] + ' target=' + stepsTarget + ' steps');
+    var _scStart = Date.now();
+    dbgEvent('SC-start', _DN[dir]+' tgt='+stepsTarget+' exp='+ms+'ms', 'G');
     send({cmd:'move', dir:dir, steps:stepsTarget});
     var wdg = setTimeout(function() {
       if (!pendingOdoCb) return;
       pendingOdoCb = null;
-      dbgEvent('driveFor-steps-WDG', 'watchdog at ' + ms + 'ms', 'W');
+      var _wdgMs = Date.now() - _scStart;
+      dbgEvent('SC-WDG', _DN[dir]+' NO ODO after '+_wdgMs+'ms (exp '+ms+'ms)', 'E');
       send({cmd:'stop'});
       applyTime(dir, ms);
       setTimeout(function() { onDone(0); }, 100);
     }, ms * 2 + 2000);
     pendingOdoCb = function(steps) {
       clearTimeout(wdg);
+      var _scMs = Date.now() - _scStart;
+      dbgEvent('SC-odo-cb', _DN[dir]+' steps='+steps+' actual='+_scMs+'ms exp='+ms+'ms', 'G');
+      dbgRolling(dbg.replayLog, { dir:dir, cmdMs:ms, actualMs:_scMs, lag:_scMs-ms, mode:'SC' }, 40);
       send({cmd:'stop'});  /* belt-and-suspenders: MCU2 already stopped */
       /* Update odometry from real step count (FWD/BWD only; turns use time-based) */
       if (dir === 0 || dir === 1) {
@@ -988,6 +994,8 @@ function doReplay(segments, onDone) {
     var seg = segments[i++];
     /* Subtract previous segment's overrun so error doesn't accumulate */
     var adjDur = Math.max(50, seg.dur - Math.max(0, prevLag || 0));
+    var useStepCount = (seg.steps || 0) >= 200;
+    dbgEvent('seg', '#'+i+'/'+segments.length+' '+_DN[seg.dir]+' dur='+seg.dur+'ms adj='+adjDur+'ms steps='+(seg.steps||0)+(useStepCount?' [SC]':' [time]'), 'G');
     setSt('Replay ' + i + '/' + segments.length +
           '  dir=' + ['FWD','BWD','LEFT','RIGHT'][seg.dir] +
           '  ' + adjDur + 'ms' + (prevLag > 5 ? ' (adj -'+prevLag+'ms)' : ''));
