@@ -142,9 +142,9 @@ static void MX_TIM3_Init(uint32_t period);
     if (printMutex) xSemaphoreGive(printMutex); \
 } while (0)
 
-/* Verbose debug-only print: silenced for normal operation.
- * Re-enable by changing DBG_VERBOSE to 1 if a regression needs tracing. */
-#define DBG_VERBOSE 0
+/* Verbose debug-only print: enabled for emergency-stop tracing.
+ * Set DBG_VERBOSE to 0 once the issue is resolved. */
+#define DBG_VERBOSE 1
 #define DPRINT(...) do { if (DBG_VERBOSE) PRINT(__VA_ARGS__); } while (0)
 
 /* ═══════════════════════════════════════════════════════════════
@@ -283,10 +283,12 @@ static void stepper1_start(GPIO_PinState dir, uint32_t target) {
 	__HAL_TIM_SET_COUNTER(&htim2, 0);
 	__HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
 	HAL_TIM_Base_Start_IT(&htim2);
+	PRINT("[M1] START dir=%u tgt=%lu emrg=%u\r\n", (unsigned)dir, target, (unsigned)g_emergencyStop);
 }
 static void stepper1_stop(void) {
 	HAL_TIM_Base_Stop_IT(&htim2);
 	HAL_GPIO_WritePin(STEP_PORT, STEP_PIN, GPIO_PIN_RESET);
+	PRINT("[M1] STOP m1=%lu tgt=%lu\r\n", motor1_steps, stepTarget1);
 }
 static void stepper2_start(GPIO_PinState dir, uint32_t target) {
 	HAL_GPIO_WritePin(DIR2_PORT, DIR2_PIN, dir);
@@ -295,10 +297,12 @@ static void stepper2_start(GPIO_PinState dir, uint32_t target) {
 	__HAL_TIM_SET_COUNTER(&htim3, 0);
 	__HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
 	HAL_TIM_Base_Start_IT(&htim3);
+	PRINT("[M2] START dir=%u tgt=%lu emrg=%u\r\n", (unsigned)dir, target, (unsigned)g_emergencyStop);
 }
 static void stepper2_stop(void) {
 	HAL_TIM_Base_Stop_IT(&htim3);
 	HAL_GPIO_WritePin(STEP2_PORT, STEP2_PIN, GPIO_PIN_RESET);
+	PRINT("[M2] STOP m2=%lu tgt=%lu\r\n", motor2_steps, stepTarget2);
 }
 
 /* ── Emergency replay FIFO helpers ──────────────────────────────
@@ -529,11 +533,12 @@ static void stepperTask1(void *arg) {
 		/* ── Step-count mode: poll for ISR notification or stop command ── */
 		if (stepMode) {
 			uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
-			/* Heartbeat every ~200ms so we see if ISR is incrementing motor1_steps */
+			/* Heartbeat every ~200ms */
 			if (++hbDiv >= 10) {
 				hbDiv = 0;
-				DPRINT("[S1] HB m1=%lu m2=%lu tgt=%lu elapsed=%lums\r\n",
-					motor1_steps, motor2_steps, stepTarget1,
+				PRINT("[S1] HB m1=%lu tgt=%lu emrg=%u q=%u t=%lu\r\n",
+					motor1_steps, stepTarget1,
+					(unsigned)g_emergencyStop, g_emrgQCount,
 					HAL_GetTick() - scStartTick);
 			}
 			if (!notified) {
@@ -744,7 +749,8 @@ static void canRxTask(void *arg) {
 			NavCmd_t cmd = { dir, steps, speed };
 			xQueueOverwrite(stepQueue1, &cmd); /* latest command wins */
 			xQueueOverwrite(stepQueue2, &cmd);
-			// PRINT("[CAN] dir=%u steps=%u t=%lu\r\n", dir, steps, HAL_GetTick());
+			PRINT("[CAN] MOVE dir=%u steps=%u speed=%u curDir=%u curSpd=%u\r\n",
+					dir, steps, speed, g_curDir, g_curSpeed);
 			break;
 		}
 		case CAN_ID_EMERGENCY_STOP: {
