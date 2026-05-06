@@ -588,13 +588,19 @@ async function doConnect() {
 }
 
 function onBleDisconnect() {
+  var wasOK = ok;
   ok = false;
   cmdChar = null;
   document.getElementById('stdot').className = '';
-  setSt('BLE disconnected');
-  dbgEvent('ble', 'DISCONNECTED', 'E');
-  /* Auto-reconnect — known device does not require a new user gesture */
-  setTimeout(function() { if (bleDevice) doConnect(); }, 500);
+  setSt('\u26a0 BLE DISCONNECTED — auto-reconnecting\u2026');
+  dbgEvent('ble', 'DISCONNECTED wasOK='+wasOK+' replaying='+replaying+' delivery='+(!!_delivery), 'E');
+  /* Auto-reconnect \u2014 known device does not require a new user gesture */
+  setTimeout(function() {
+    if (bleDevice) {
+      dbgEvent('ble', 'auto-reconnect attempt', 'W');
+      doConnect();
+    }
+  }, 500);
 }
 
 function onBleNotify(event) {
@@ -653,7 +659,8 @@ function setSt(t)      { document.getElementById('stmsg').textContent = t; }
 function setText(id,t) { document.getElementById(id).textContent = t; }
 function send(o) {
   if (!cmdChar || !ok) {
-    dbgEvent('tx-DROP', 'no BLE: '+JSON.stringify(o), 'E');
+    dbgEvent('tx-DROP', 'no BLE: cmdChar='+(!!cmdChar)+' ok='+ok+' '+JSON.stringify(o), 'E');
+    setSt('⚠ TX-DROP (BLE down): '+JSON.stringify(o));
     return;
   }
   var seq = ++dbg.txSeq;
@@ -661,6 +668,8 @@ function send(o) {
   var entry = { ts:'+'+((t0-dbg.t0)/1000).toFixed(3)+'s', seq:seq, cmd:JSON.stringify(o), ms:0, ok:null, err:null };
   dbg.txLog.push(entry);
   if (dbg.txLog.length > 60) dbg.txLog.shift();
+  /* Always log every send to event log so we can correlate with MCU2 [CAN] prints. */
+  dbgEvent('tx', '#'+seq+' '+entry.cmd, 'G');
   cmdChar.writeValueWithoutResponse(new TextEncoder().encode(JSON.stringify(o)))
     .then(function() {
       entry.ms = Date.now() - t0;
@@ -672,6 +681,7 @@ function send(o) {
       entry.ok = false;
       entry.err = String(e && e.message || e).substring(0,60);
       dbgEvent('tx-FAIL', '#'+seq+' '+entry.cmd+' err='+entry.err, 'E');
+      setSt('⚠ TX-FAIL #'+seq+': '+entry.err);
       console.warn('BLE write:', e);
     });
   if (o.cmd==='move'||o.cmd==='stop') dbg.lastMoveTs = Date.now();
@@ -995,6 +1005,7 @@ function toggleRecord() {
 /* Drive direction `dir` for `ms` milliseconds (or `stepsTarget` hardware steps if >=200),
    then call onDone(lag_ms). */
 function driveFor(dir, ms, onDone, stepsTarget) {
+  dbgEvent('driveFor-enter', _DN[dir]+' ms='+ms+' stepsTarget='+stepsTarget+' bleOK='+ok+' cmdChar='+(!!cmdChar), 'G');
   /* ── STEP-COUNT CLOSED-LOOP MODE ──
      MCU2 threshold = 200 (STEP_COUNT_THRESHOLD). When cmd.steps >= 200, MCU2
      enters step-count mode: ISR self-stops at target and sends CAN 0x214 odo frame.
@@ -1003,7 +1014,7 @@ function driveFor(dir, ms, onDone, stepsTarget) {
   if (stepsTarget >= 200) {
     var _scStart = Date.now();
     var _mySeq = ++pendingOdoSeq;
-    dbgEvent('SC-start', _DN[dir]+' tgt='+stepsTarget+' exp='+ms+'ms seq='+_mySeq, 'G');
+    dbgEvent('SC-start', _DN[dir]+' tgt='+stepsTarget+' exp='+ms+'ms seq='+_mySeq+' bleOK='+ok, 'G');
     send({cmd:'move', dir:dir, steps:stepsTarget});
     var wdg = setTimeout(function() {
       if (pendingOdoSeq !== _mySeq || !pendingOdoCb) return; /* already resolved */
@@ -1075,11 +1086,13 @@ function setReplayBtn(active) {
 }
 
 function doReplay(segments, onDone) {
+  dbgEvent('doReplay-start', 'segs='+segments.length+' bleOK='+ok+' cmdChar='+(!!cmdChar), 'G');
   replaying = true;
   setReplayBtn(true);
   var i = 0;
   function next(prevLag) {
     if (!replaying || i >= segments.length) {
+      dbgEvent('doReplay-end', 'i='+i+'/'+segments.length+' replaying='+replaying, 'G');
       replaying = false;
       stopMove();
       setReplayBtn(false);
@@ -1583,6 +1596,7 @@ function planAndDeliver() {
 }
 
 function runNextLeg() {
+  dbgEvent('runNextLeg', '_delivery='+(!!_delivery)+' abort='+(_delivery&&_delivery.abort)+' idx='+(_delivery?_delivery.idx:'-')+'/'+(_delivery?_delivery.legs.length:'-'), 'G');
   if (!_delivery || _delivery.abort) { _delivery = null; return; }
   var d = _delivery;
   if (d.idx >= d.legs.length) {
@@ -1596,7 +1610,9 @@ function runNextLeg() {
   document.getElementById('planInfo').textContent =
     'Leg ' + (d.idx+1) + '/' + d.legs.length + ': ' + leg.from + ' → ' + leg.to + ' (' + leg.segs.length + ' seg)';
 
+  dbgEvent('leg-start', '#'+(d.idx+1)+'/'+d.legs.length+' '+leg.from+'→'+leg.to+' segs='+leg.segs.length+' isDelivery='+leg.isDelivery, 'G');
   doReplay(leg.segs.slice(), function() {
+    dbgEvent('leg-done', '#'+(d.idx+1)+' isDelivery='+leg.isDelivery+' bleOK='+ok, 'G');
     if (!_delivery || _delivery.abort) { _delivery = null; return; }
     _delivery.idx++;
     if (leg.isDelivery) {
@@ -1604,7 +1620,11 @@ function runNextLeg() {
       var arrivedAt = leg.to;
       setSt('Arrived at ' + arrivedAt + ' — unload then click OK');
       setTimeout(function(){
+        dbgEvent('confirm-pre', 'arrivedAt='+arrivedAt+' bleOK='+ok+' cmdChar='+(!!cmdChar), 'G');
+        var _tConfirm0 = Date.now();
         var confirmed = confirm('Arrived at "' + arrivedAt + '".\n\nClick OK after the food has been unloaded.\n(Cancel = abort delivery.)');
+        var _confirmDur = Date.now() - _tConfirm0;
+        dbgEvent('confirm-post', 'result='+confirmed+' waitMs='+_confirmDur+' bleOK='+ok+' cmdChar='+(!!cmdChar), confirmed?'G':'W');
         if (!confirmed) { cancelDelivery(); return; }
         /* Auto-mark all pending orders for this table as delivered */
         var marked = 0;
@@ -1613,8 +1633,13 @@ function runNextLeg() {
         });
         if (marked > 0) renderOrders();
         /* Tell ESP32 to mark orders delivered so /api/tables shows table as free */
+        dbgEvent('post-OK-tx', 'about to send order_delivered + runNextLeg', 'G');
         send({cmd:'order_delivered', table: arrivedAt});
-        runNextLeg();
+        /* Small delay so BLE stack settles between order_delivered and the next move command. */
+        setTimeout(function() {
+          dbgEvent('post-OK-runNextLeg', 'idx='+(_delivery?_delivery.idx:'null')+' bleOK='+ok, 'G');
+          runNextLeg();
+        }, 200);
       }, 50);
     } else {
       /* Pure transit — small settle then continue */
