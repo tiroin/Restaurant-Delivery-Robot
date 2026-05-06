@@ -28,6 +28,9 @@
   .table-btn.occupied::after { content: 'Occupied'; display: block;
                                font-size: 0.65rem; font-weight: 400;
                                color: #e05a00; margin-top: 4px; }
+  .lift-btn { display: block; margin-top: 6px; font-size: 0.65rem; font-weight: 600;
+              color: #fff; background: #e05a00; border: none; border-radius: 6px;
+              padding: 2px 8px; cursor: pointer; width: 100%; }
 
   /* Menu */
   #menu-table-name { text-align: center; font-size: 1.1rem; font-weight: 600;
@@ -122,6 +125,9 @@
 
   /* ── Load tables ─────────────────────────── */
   async function loadTables() {
+    document.getElementById('loading').style.display = 'block';
+    document.getElementById('table-grid').style.display = 'none';
+    document.getElementById('no-tables').style.display = 'none';
     try {
       const r = await fetch('/api/tables');
       const d = await r.json();
@@ -139,9 +145,17 @@
         const b = document.createElement('div');
         const isOccupied = occupied.has(t);
         b.className = 'table-btn' + (isOccupied ? ' occupied' : '');
-        b.textContent = t;
         b.dataset.name = t;
-        if (!isOccupied) b.onclick = () => selectTable(b, t);
+        b.innerHTML = t;
+        if (isOccupied) {
+          const lift = document.createElement('button');
+          lift.className = 'lift-btn';
+          lift.textContent = 'Lift';
+          lift.onclick = (e) => { e.stopPropagation(); clearOccupied(t); };
+          b.appendChild(lift);
+        } else {
+          b.onclick = () => selectTable(b, t);
+        }
         grid.appendChild(b);
       });
     } catch(e) {
@@ -154,6 +168,15 @@
     el.classList.add('selected');
     selectedTable = name;
     document.getElementById('btn-select-table').disabled = false;
+  }
+
+  async function clearOccupied(table) {
+    await fetch('/api/clear', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({table: table})
+    }).catch(() => {});
+    loadTables();
   }
 
   function goToMenu() {
@@ -193,7 +216,10 @@
   }
 
   function goBack() {
+    selectedTable = null;
+    document.getElementById('btn-select-table').disabled = true;
     showScreen('screen-tables');
+    loadTables();
   }
 
   async function submitOrder() {
@@ -212,6 +238,7 @@
       if (d.ok) {
         document.getElementById('confirm-detail').innerHTML =
           '<strong>' + selectedTable + '</strong><br>' + items;
+        selectedTable = null; /* order placed — server tracks it now */
         showScreen('confirm-screen');
       } else {
         alert('Order failed. Please try again.');
@@ -229,8 +256,8 @@
     selectedTable = null;
     checkedItems.clear();
     document.getElementById('btn-select-table').disabled = true;
-    document.querySelectorAll('.table-btn').forEach(b => b.classList.remove('selected'));
     showScreen('screen-tables');
+    loadTables(); /* re-fetch so delivered tables are no longer occupied */
   }
 
   function showScreen(id) {

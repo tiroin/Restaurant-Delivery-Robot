@@ -67,6 +67,11 @@ static SemaphoreHandle_t s_order_mutex = NULL;
 static char s_tables_json[512] = "{\"tables\":[]}"; /* default empty */
 static SemaphoreHandle_t s_tables_mutex = NULL;
 
+/* ── Selected tables (customer clicked but not yet ordered) ─── */
+static char              s_selected[MAX_TABLES][MAX_TABLE_NAME];
+static int               s_selected_count = 0;
+static SemaphoreHandle_t s_selected_mutex = NULL;
+
 /* Load table list from NVS into s_tables_json */
 static void tables_load_nvs(void)
 {
@@ -273,15 +278,16 @@ static esp_err_t api_tables_get_handler(httpd_req_t *req)
     if (close) *close = '\0';
     pos = snprintf(buf, sizeof(buf), "%s,\"occupied\":", base);
 
-    /* Collect occupied tables (those with at least one pending order) */
-    xSemaphoreTake(s_order_mutex, portMAX_DELAY);
-    char seen[MAX_ORDERS][MAX_TABLE_NAME];
+    /* Collect occupied: pending orders + currently selected */
+    char seen[MAX_ORDERS + MAX_TABLES][MAX_TABLE_NAME];
     int  seen_count = 0;
     bool first = true;
     pos += snprintf(buf + pos, sizeof(buf) - pos, "[");
+
+    /* 1. Tables with at least one pending order */
+    xSemaphoreTake(s_order_mutex, portMAX_DELAY);
     for (int i = 0; i < s_order_count; i++) {
         if (s_orders[i].status != 0) continue;
-        /* Check not already added */
         bool dup = false;
         for (int j = 0; j < seen_count; j++) {
             if (strcmp(seen[j], s_orders[i].table) == 0) { dup = true; break; }
@@ -293,6 +299,22 @@ static esp_err_t api_tables_get_handler(httpd_req_t *req)
         first = false;
     }
     xSemaphoreGive(s_order_mutex);
+
+    /* 2. Tables currently selected by a customer (not yet ordered) */
+    xSemaphoreTake(s_selected_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_selected_count; i++) {
+        bool dup = false;
+        for (int j = 0; j < seen_count; j++) {
+            if (strcmp(seen[j], s_selected[i]) == 0) { dup = true; break; }
+        }
+        if (dup) continue;
+        strncpy(seen[seen_count++], s_selected[i], MAX_TABLE_NAME - 1);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"%s\"",
+                        first ? "" : ",", s_selected[i]);
+        first = false;
+    }
+    xSemaphoreGive(s_selected_mutex);
+
     snprintf(buf + pos, sizeof(buf) - pos, "]}");
 
     httpd_resp_set_type(req, "application/json");
@@ -370,6 +392,18 @@ static esp_err_t api_order_post_handler(httpd_req_t *req)
     }
     xSemaphoreGive(s_order_mutex);
 
+    /* Remove table from selected list (order now tracks it) */
+    xSemaphoreTake(s_selected_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_selected_count; i++) {
+        if (strncmp(s_selected[i], table, MAX_TABLE_NAME) == 0) {
+            for (int j = i; j < s_selected_count - 1; j++)
+                memcpy(s_selected[j], s_selected[j + 1], MAX_TABLE_NAME);
+            s_selected_count--;
+            break;
+        }
+    }
+    xSemaphoreGive(s_selected_mutex);
+
     /* Notify staff via BLE */
     char notify[320];
     snprintf(notify, sizeof(notify),
@@ -385,6 +419,101 @@ static esp_err_t api_order_post_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, resp);
     ESP_LOGI(TAG, "[ORDER] #%" PRIu32 " table=%s items=%s", oid, table, items);
+    return ESP_OK;
+}
+
+/* ══════════════════════════════════════════════
+ *  HTTP POST /api/clear — staff lifts occupied state for a table
+ *  Body: {"table":"T1"}
+ * ══════════════════════════════════════════════ */
+static esp_err_t api_clear_post_handler(httpd_req_t *req)
+{
+    char body[128];
+    int total = req->content_len < (int)sizeof(body) - 1
+                ? req->content_len : (int)sizeof(body) - 1;
+    int recv = 0;
+    while (recv < total) {
+        int r = httpd_req_recv(req, body + recv, total - recv);
+        if (r <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Read error"); return ESP_FAIL; }
+        recv += r;
+    }
+    body[recv] = '\0';
+    char table[MAX_TABLE_NAME] = {0};
+    json_get_str(body, "table", table, sizeof(table));
+    if (table[0] != '\0') {
+        wifi_ap_ws_mark_delivered(table);
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    ESP_LOGI(TAG, "[CLEAR] table=%s", table);
+    return ESP_OK;
+}
+
+/* ══════════════════════════════════════════════
+ *  HTTP POST /api/select — mark table as selected
+ *  Body: {"table":"T1"}
+ * ══════════════════════════════════════════════ */
+static esp_err_t api_select_post_handler(httpd_req_t *req)
+{
+    char body[128];
+    int total = req->content_len < (int)sizeof(body) - 1
+                ? req->content_len : (int)sizeof(body) - 1;
+    int recv = 0;
+    while (recv < total) {
+        int r = httpd_req_recv(req, body + recv, total - recv);
+        if (r <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Read error"); return ESP_FAIL; }
+        recv += r;
+    }
+    body[recv] = '\0';
+    char table[MAX_TABLE_NAME] = {0};
+    json_get_str(body, "table", table, sizeof(table));
+    if (table[0] == '\0') { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing table"); return ESP_FAIL; }
+    xSemaphoreTake(s_selected_mutex, portMAX_DELAY);
+    bool found = false;
+    for (int i = 0; i < s_selected_count; i++) {
+        if (strncmp(s_selected[i], table, MAX_TABLE_NAME) == 0) { found = true; break; }
+    }
+    if (!found && s_selected_count < MAX_TABLES) {
+        strncpy(s_selected[s_selected_count++], table, MAX_TABLE_NAME - 1);
+    }
+    xSemaphoreGive(s_selected_mutex);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    ESP_LOGI(TAG, "[SELECT] table=%s", table);
+    return ESP_OK;
+}
+
+/* ══════════════════════════════════════════════
+ *  HTTP POST /api/deselect — release table selection
+ *  Body: {"table":"T1"}
+ * ══════════════════════════════════════════════ */
+static esp_err_t api_deselect_post_handler(httpd_req_t *req)
+{
+    char body[128];
+    int total = req->content_len < (int)sizeof(body) - 1
+                ? req->content_len : (int)sizeof(body) - 1;
+    int recv = 0;
+    while (recv < total) {
+        int r = httpd_req_recv(req, body + recv, total - recv);
+        if (r <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Read error"); return ESP_FAIL; }
+        recv += r;
+    }
+    body[recv] = '\0';
+    char table[MAX_TABLE_NAME] = {0};
+    json_get_str(body, "table", table, sizeof(table));
+    xSemaphoreTake(s_selected_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_selected_count; i++) {
+        if (strncmp(s_selected[i], table, MAX_TABLE_NAME) == 0) {
+            for (int j = i; j < s_selected_count - 1; j++)
+                memcpy(s_selected[j], s_selected[j + 1], MAX_TABLE_NAME);
+            s_selected_count--;
+            break;
+        }
+    }
+    xSemaphoreGive(s_selected_mutex);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    ESP_LOGI(TAG, "[DESELECT] table=%s", table);
     return ESP_OK;
 }
 
@@ -511,9 +640,10 @@ esp_err_t wifi_ap_ws_broadcast(const char *json_str)
 static esp_err_t start_webserver(void)
 {
     httpd_config_t config   = HTTPD_DEFAULT_CONFIG();
-    config.max_open_sockets = 10;
-    config.stack_size       = 8192;
-    config.lru_purge_enable = true;
+    config.max_open_sockets  = 10;
+    config.max_uri_handlers  = 10;
+    config.stack_size        = 8192;
+    config.lru_purge_enable  = true;
     config.uri_match_fn     = httpd_uri_match_wildcard;
 
     ESP_RETURN_ON_ERROR(httpd_start(&s_server, &config),
@@ -562,6 +692,27 @@ static esp_err_t start_webserver(void)
     };
     httpd_register_uri_handler(s_server, &api_order_post_uri);
 
+    static const httpd_uri_t api_clear_uri = {
+        .uri     = "/api/clear",
+        .method  = HTTP_POST,
+        .handler = api_clear_post_handler,
+    };
+    httpd_register_uri_handler(s_server, &api_clear_uri);
+
+    static const httpd_uri_t api_select_uri = {
+        .uri     = "/api/select",
+        .method  = HTTP_POST,
+        .handler = api_select_post_handler,
+    };
+    httpd_register_uri_handler(s_server, &api_select_uri);
+
+    static const httpd_uri_t api_deselect_uri = {
+        .uri     = "/api/deselect",
+        .method  = HTTP_POST,
+        .handler = api_deselect_post_handler,
+    };
+    httpd_register_uri_handler(s_server, &api_deselect_uri);
+
     ESP_LOGI(TAG, "HTTP server on :80  WS /ws  Customer /customer  API /api/*");
     return ESP_OK;
 }
@@ -593,8 +744,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 esp_err_t wifi_ap_ws_init(void)
 {
     /* Init mutexes and load saved table list */
-    s_order_mutex  = xSemaphoreCreateMutex();
-    s_tables_mutex = xSemaphoreCreateMutex();
+    s_order_mutex   = xSemaphoreCreateMutex();
+    s_tables_mutex  = xSemaphoreCreateMutex();
+    s_selected_mutex = xSemaphoreCreateMutex();
     tables_load_nvs();
 
     /* Init TCP/IP stack and default event loop (required before netif/wifi) */
