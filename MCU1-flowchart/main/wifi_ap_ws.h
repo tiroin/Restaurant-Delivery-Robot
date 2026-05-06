@@ -48,6 +48,14 @@ esp_err_t wifi_ap_ws_init(void);
  */
 esp_err_t wifi_ap_ws_broadcast(const char *json_str);
 
+/**
+ * @brief Update the table list stored in RAM and NVS.
+ *        Called from BLE command handler when cmd=set_tables arrives.
+ *
+ * @param tables_array  JSON array string, e.g. ["T1","T2","T3"]
+ */
+void wifi_ap_ws_set_tables(const char *tables_array);
+
 #ifdef __cplusplus
 }
 #endif

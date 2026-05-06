@@ -189,21 +189,11 @@ static void handle_ws_message(const char *msg)
 
     } else if (strcmp(cmd, "set_tables") == 0) {
         /* {"cmd":"set_tables","tables":["Table 1","Table 2",...]} */
-        /* Find the "tables" array in the JSON and store it */
         const char *arr = strstr(msg, "\"tables\":");
         if (arr) {
             arr += strlen("\"tables\":");
             while (*arr == ' ' || *arr == '\t') arr++;
-            /* Build JSON object {"tables":[...]} */
-            xSemaphoreTake(s_tables_mutex, portMAX_DELAY);
-            snprintf(s_tables_json, sizeof(s_tables_json), "{\"tables\":%s}", arr);
-            /* Trim trailing brace from original msg that may follow the array */
-            /* Find the closing ] and null-terminate the JSON object properly */
-            char *end = strchr(s_tables_json, ']');
-            if (end) { end[1] = '}'; end[2] = '\0'; }
-            xSemaphoreGive(s_tables_mutex);
-            tables_save_nvs();
-            ESP_LOGI(TAG, "Tables updated: %s", s_tables_json);
+            wifi_ap_ws_set_tables(arr);
         }
 
     } else {
@@ -212,14 +202,15 @@ static void handle_ws_message(const char *msg)
 }
 
 /* ══════════════════════════════════════════════
- *  HTTP GET / — serve staff HTML page
+ *  HTTP GET / — serve customer ordering page
+ *  (staff app lives on GitHub Pages, not here)
  * ══════════════════════════════════════════════ */
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     ESP_LOGW(TAG, ">>>> HTTP GET / from sockfd=%d <<<<", httpd_req_to_sockfd(req));
-    size_t len = (size_t)(index_html_end - index_html_start);
+    size_t len = (size_t)(customer_html_end - customer_html_start);
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    httpd_resp_send(req, (const char *)index_html_start, (ssize_t)len);
+    httpd_resp_send(req, (const char *)customer_html_start, (ssize_t)len);
     return ESP_OK;
 }
 
@@ -237,6 +228,19 @@ static esp_err_t customer_get_handler(httpd_req_t *req)
 /* ══════════════════════════════════════════════
  *  HTTP GET /api/tables — return table list JSON
  * ══════════════════════════════════════════════ */
+void wifi_ap_ws_set_tables(const char *tables_array)
+{
+    /* tables_array is a JSON array like ["T1","T2","T3"] possibly with trailing garbage */
+    xSemaphoreTake(s_tables_mutex, portMAX_DELAY);
+    snprintf(s_tables_json, sizeof(s_tables_json), "{\"tables\":%s}", tables_array);
+    /* Find the closing ] and terminate the JSON object cleanly */
+    char *end = strchr(s_tables_json, ']');
+    if (end) { end[1] = '}'; end[2] = '\0'; }
+    xSemaphoreGive(s_tables_mutex);
+    tables_save_nvs();
+    ESP_LOGI(TAG, "Tables updated: %s", s_tables_json);
+}
+
 static esp_err_t api_tables_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
@@ -542,6 +546,10 @@ esp_err_t wifi_ap_ws_init(void)
     s_order_mutex  = xSemaphoreCreateMutex();
     s_tables_mutex = xSemaphoreCreateMutex();
     tables_load_nvs();
+
+    /* Init TCP/IP stack and default event loop (required before netif/wifi) */
+    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "esp_netif_init failed");
+    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "event_loop_create failed");
 
     /* Create default AP netif (provides DHCP server + lwIP AP interface) */
     esp_netif_create_default_wifi_ap();

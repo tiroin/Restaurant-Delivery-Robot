@@ -34,6 +34,7 @@
 
 #include "ble_robot.h"
 #include "robot_types.h"
+#include "wifi_ap_ws.h"
 
 static const char *TAG = "BLE";
 
@@ -132,6 +133,15 @@ static void handle_command(const char *msg)
     } else if (strcmp(cmd, "set_mode") == 0) {
         uint8_t mode = (uint8_t)json_get_int(msg, "mode", 0);
         can_tx(CAN_ID_SET_MODE, &mode, 1);
+
+    } else if (strcmp(cmd, "set_tables") == 0) {
+        /* Forward table list to WiFi AP module for storage and HTTP serving */
+        const char *arr = strstr(msg, "\"tables\":");
+        if (arr) {
+            arr += strlen("\"tables\":");
+            while (*arr == ' ' || *arr == '\t') arr++;
+            wifi_ap_ws_set_tables(arr);
+        }
     }
 }
 

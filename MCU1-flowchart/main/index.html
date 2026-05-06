@@ -1186,8 +1186,8 @@ function renderOrders() {
       + '</div>'
       + '<div style="color:#555;margin:2px 0 4px">' + escHtml(o.items) + '</div>'
       + (o.done
-        ? '<span style="font-size:.65rem;color:#aaa">&#10003; Delivered</span>'
-        : '<button class="minibtn" style="font-size:.6rem" onclick="markDelivered('+i+')">&#10003; Delivered</button>')
+        ? '<span style="font-size:.65rem;color:#34a853">&#10003; Delivered</span>'
+        : '<span style="font-size:.65rem;color:#f4a933">&#9679; Pending delivery</span>')
       + '</div>';
   }).join('');
 }
@@ -1601,10 +1601,17 @@ function runNextLeg() {
     _delivery.idx++;
     if (leg.isDelivery) {
       /* Pause for waiter to unload */
-      setSt('Arrived at ' + leg.to + ' — unload then click OK');
+      var arrivedAt = leg.to;
+      setSt('Arrived at ' + arrivedAt + ' — unload then click OK');
       setTimeout(function(){
-        var ok = confirm('Arrived at "' + leg.to + '".\n\nClick OK after the food has been unloaded.\n(Cancel = abort delivery.)');
-        if (!ok) { cancelDelivery(); return; }
+        var confirmed = confirm('Arrived at "' + arrivedAt + '".\n\nClick OK after the food has been unloaded.\n(Cancel = abort delivery.)');
+        if (!confirmed) { cancelDelivery(); return; }
+        /* Auto-mark all pending orders for this table as delivered */
+        var marked = 0;
+        allOrders.forEach(function(o) {
+          if (!o.done && o.table === arrivedAt) { o.done = true; marked++; }
+        });
+        if (marked > 0) renderOrders();
         runNextLeg();
       }, 50);
     } else {
