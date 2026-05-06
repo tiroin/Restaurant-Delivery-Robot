@@ -61,6 +61,8 @@
 #define CAN_ID_HEARTBEAT_MCU1   0x105U  /* MCU1 → MCU2 */
 #define CAN_ID_CP_SAVED_ACK     0x212U  /* MCU2 → MCU1: data[0]=cp_id, data[1]=0 OK */
 #define CAN_ID_ODOMETRY         0x214U  /* MCU2 → MCU1: dir,s1_hi,s1_lo,s2_hi,s2_lo,tk_hi,tk_lo */
+#define CAN_ID_EMERGENCY_STOP   0x302U  /* MCU3 → MCU2: front-sensor emergency */
+#define CAN_ID_PATH_CLEAR       0x303U  /* MCU3 → MCU2: front clear, resume saved leg */
 #define STEP_COUNT_THRESHOLD    200U    /* steps >= this in NavCmd_t → closed-loop step-count mode */
 
 /* ── Types ───────────────────────────────────────────────────── */
@@ -108,6 +110,13 @@ static volatile uint32_t motor2_steps = 0;
 static volatile uint32_t stepTarget1 = 0;   /* 0 = unlimited; ISR self-stops when reached */
 static volatile uint32_t stepTarget2 = 0;
 
+/* ── Emergency-stop state (set by 0x302, cleared by 0x303 or next MANUAL_MOVE) ── */
+static volatile bool g_emergencyStop = false;
+static volatile uint8_t g_savedDir = 0;
+static volatile uint16_t g_savedRem1 = 0;
+static volatile uint16_t g_savedRem2 = 0;
+static volatile uint16_t g_savedSpeed = 0;
+
 /* ── Forward declarations ────────────────────────────────────── */
 void SystemClock_Config(void);
 void Error_Handler(void);
@@ -123,6 +132,11 @@ static void MX_TIM3_Init(uint32_t period);
     printf(__VA_ARGS__); \
     if (printMutex) xSemaphoreGive(printMutex); \
 } while (0)
+
+/* Verbose debug-only print: silenced for normal operation.
+ * Re-enable by changing DBG_VERBOSE to 1 if a regression needs tracing. */
+#define DBG_VERBOSE 0
+#define DPRINT(...) do { if (DBG_VERBOSE) PRINT(__VA_ARGS__); } while (0)
 
 /* ═══════════════════════════════════════════════════════════════
  * FDCAN RX FIFO0 CALLBACK  (ISR)
@@ -288,7 +302,7 @@ static void send_odometry(uint8_t dir) {
 		(uint8_t)(s2 >> 8), (uint8_t)(s2 & 0xFF),
 		(uint8_t)(tk >> 8), (uint8_t)(tk & 0xFF)
 	};
-	PRINT("[ODO] dir=%u s1=%u s2=%u t=%lu\r\n", dir, s1, s2, HAL_GetTick());
+	DPRINT("[ODO] dir=%u s1=%u s2=%u t=%lu\r\n", dir, s1, s2, HAL_GetTick());
 	can_tx(CAN_ID_ODOMETRY, buf, 7);
 }
 
@@ -364,9 +378,9 @@ static void bmi160Task(void *arg) {
 
 		if (++printDiv >= 50) {
 			printDiv = 0;
-//			PRINT("[IMU] A=%.2f,%.2f,%.2fg  G=%.1f,%.1f,%.1f dps\r\n",
-//					g_ax / 16384.0f, g_ay / 16384.0f, g_az / 16384.0f,
-//					g_gx / 16.4f, g_gy / 16.4f, g_gz / 16.4f);
+			DPRINT("[IMU] A=%.2f,%.2f,%.2fg  G=%.1f,%.1f,%.1f dps\r\n",
+					g_ax / 16384.0f, g_ay / 16384.0f, g_az / 16384.0f,
+					g_gx / 16.4f, g_gy / 16.4f, g_gz / 16.4f);
 			if (imuTxHandle)
 				xTaskNotifyGive(imuTxHandle); /* signal imuTxTask every 50 samples */
 		}
@@ -401,16 +415,16 @@ static void imuTxTask(void *arg) {
 
 		HAL_StatusTypeDef ra = can_tx(CAN_ID_IMU_ACCEL, abuf, 6);
 		HAL_StatusTypeDef rg = can_tx(CAN_ID_IMU_GYRO, gbuf, 6);
-//		if (ra == HAL_OK && rg == HAL_OK) {
-//			txCount++;
-//			if ((txCount % 10) == 0)
-//				PRINT("[CAN-TX] #%lu  A=%d,%d,%d  G=%d,%d,%d\r\n", txCount,
-//						ax100, ay100, az100, gx100, gy100, gz100);
-//		} else {
-//			txFail++;
-//			PRINT("[CAN-TX] FAIL #%lu  PSR=0x%08lX\r\n", txFail,
-//					hfdcan1.Instance->PSR);
-//		}
+		if (ra == HAL_OK && rg == HAL_OK) {
+			txCount++;
+			if ((txCount % 10) == 0)
+				DPRINT("[CAN-TX] #%lu  A=%d,%d,%d  G=%d,%d,%d\r\n", txCount,
+						ax100, ay100, az100, gx100, gy100, gz100);
+		} else {
+			txFail++;
+			PRINT("[CAN-TX] FAIL #%lu  PSR=0x%08lX\r\n", txFail,
+					hfdcan1.Instance->PSR);
+		}
 	}
 }
 
@@ -441,7 +455,7 @@ static void stepperTask1(void *arg) {
 			/* Heartbeat every ~200ms so we see if ISR is incrementing motor1_steps */
 			if (++hbDiv >= 10) {
 				hbDiv = 0;
-				PRINT("[S1] HB m1=%lu m2=%lu tgt=%lu elapsed=%lums\r\n",
+				DPRINT("[S1] HB m1=%lu m2=%lu tgt=%lu elapsed=%lums\r\n",
 					motor1_steps, motor2_steps, stepTarget1,
 					HAL_GetTick() - scStartTick);
 			}
@@ -449,7 +463,7 @@ static void stepperTask1(void *arg) {
 				/* Not done yet — check for explicit stop command */
 				NavCmd_t ovr;
 				if (xQueueReceive(stepQueue1, &ovr, 0) == pdTRUE && ovr.steps == 0) {
-					PRINT("[S1] STOP@SC m1=%lu tgt=%lu t=%lu\r\n",
+					DPRINT("[S1] STOP@SC m1=%lu tgt=%lu t=%lu\r\n",
 						motor1_steps, stepTarget1, HAL_GetTick());
 					stepper1_stop(); stepTarget1 = 0;
 					running = false; stepMode = false;
@@ -462,7 +476,7 @@ static void stepperTask1(void *arg) {
 			   next HAL_TIM_Base_Start_IT silently fails (state stuck at BUSY). */
 			stepper1_stop();
 			stepTarget1 = 0;
-			PRINT("[S1] ISR-DONE m1=%lu m2=%lu tgt=%lu t=%lu\r\n",
+			DPRINT("[S1] ISR-DONE m1=%lu m2=%lu tgt=%lu t=%lu\r\n",
 				motor1_steps, motor2_steps, stepTarget1, HAL_GetTick());
 			running = false; stepMode = false;
 			/* Drain stale keepalives */
@@ -476,15 +490,15 @@ static void stepperTask1(void *arg) {
 		BaseType_t got = xQueueReceive(stepQueue1, &cmd,
 				running ? pdMS_TO_TICKS(300) : portMAX_DELAY);
 		if (got == pdTRUE) {
-			PRINT("[S1] RX dir=%u steps=%u running=%u t=%lu\r\n",
+			DPRINT("[S1] RX dir=%u steps=%u running=%u t=%lu\r\n",
 				cmd.dir, cmd.steps, (unsigned)running, HAL_GetTick());
 		} else {
-			PRINT("[S1] RX-TIMEOUT 300ms running=%u m1=%lu t=%lu\r\n",
+			DPRINT("[S1] RX-TIMEOUT 300ms running=%u m1=%lu t=%lu\r\n",
 				(unsigned)running, motor1_steps, HAL_GetTick());
 		}
 		if (got == pdFALSE || cmd.steps == 0) {
 			if (running) {
-				PRINT("[S1] TIMEOUT/STOP m1=%lu t=%lu\r\n", motor1_steps, HAL_GetTick());
+				DPRINT("[S1] TIMEOUT/STOP m1=%lu t=%lu\r\n", motor1_steps, HAL_GetTick());
 				stepper1_stop(); stepTarget1 = 0;
 				running = false;
 				send_odometry(lastDir);
@@ -501,7 +515,7 @@ static void stepperTask1(void *arg) {
 		if (!running) {
 			uint32_t target = (cmd.steps >= STEP_COUNT_THRESHOLD) ? cmd.steps : 0;
 			if (target > 0) {
-				PRINT("[S1] SC-START dir=%u tgt=%lu t=%lu\r\n", cmd.dir, target, HAL_GetTick());
+				DPRINT("[S1] SC-START dir=%u tgt=%lu t=%lu\r\n", cmd.dir, target, HAL_GetTick());
 				scStartTick = HAL_GetTick();
 				hbDiv = 0;
 			}
@@ -511,7 +525,7 @@ static void stepperTask1(void *arg) {
 		} else {
 			if (cmd.steps >= STEP_COUNT_THRESHOLD) {
 				/* New step-count command while running — restart with new target */
-				PRINT("[S1] SC-RESTART dir=%u tgt=%u t=%lu\r\n", cmd.dir, cmd.steps, HAL_GetTick());
+				DPRINT("[S1] SC-RESTART dir=%u tgt=%u t=%lu\r\n", cmd.dir, cmd.steps, HAL_GetTick());
 				stepper1_stop(); stepTarget1 = 0;
 				stepper1_start(dir, cmd.steps);
 				stepMode = true;
@@ -539,12 +553,16 @@ static void stepperTask2(void *arg) {
 			if (!notified) {
 				NavCmd_t ovr;
 				if (xQueueReceive(stepQueue2, &ovr, 0) == pdTRUE && ovr.steps == 0) {
+					DPRINT("[S2] STOP@SC m2=%lu tgt=%lu t=%lu\r\n",
+						motor2_steps, stepTarget2, HAL_GetTick());
 					stepper2_stop(); stepTarget2 = 0;
 					running = false; stepMode = false;
 				}
 				continue;
 			}
 			/* ISR reached target — normalize HAL state via stepper2_stop. */
+			DPRINT("[S2] ISR-DONE m2=%lu tgt=%lu t=%lu\r\n",
+				motor2_steps, stepTarget2, HAL_GetTick());
 			stepper2_stop();
 			stepTarget2 = 0;
 			running = false; stepMode = false;
@@ -555,8 +573,18 @@ static void stepperTask2(void *arg) {
 		NavCmd_t cmd;
 		BaseType_t got = xQueueReceive(stepQueue2, &cmd,
 				running ? pdMS_TO_TICKS(300) : portMAX_DELAY);
+		if (got == pdTRUE) {
+			DPRINT("[S2] RX dir=%u steps=%u speed=%u running=%u t=%lu\r\n",
+				cmd.dir, cmd.steps, cmd.speed, (unsigned)running, HAL_GetTick());
+		} else {
+			DPRINT("[S2] RX-TIMEOUT 300ms running=%u m2=%lu t=%lu\r\n",
+				(unsigned)running, motor2_steps, HAL_GetTick());
+		}
 		if (got == pdFALSE || cmd.steps == 0) {
-			if (running) { stepper2_stop(); stepTarget2 = 0; running = false; }
+			if (running) {
+				DPRINT("[S2] TIMEOUT/STOP m2=%lu t=%lu\r\n", motor2_steps, HAL_GetTick());
+				stepper2_stop(); stepTarget2 = 0; running = false;
+			}
 			continue;
 		}
 		GPIO_PinState dir;
@@ -567,15 +595,21 @@ static void stepperTask2(void *arg) {
 		}
 		if (!running) {
 			uint32_t target = (cmd.steps >= STEP_COUNT_THRESHOLD) ? cmd.steps : 0;
+			DPRINT("[S2] START dir=%u tgt=%lu mode=%s t=%lu\r\n",
+				cmd.dir, target, target > 0 ? "SC" : "CONT", HAL_GetTick());
 			stepper2_start(dir, target);
 			running = true;
 			stepMode = (target > 0);
 		} else {
 			if (cmd.steps >= STEP_COUNT_THRESHOLD) {
+				DPRINT("[S2] SC-RESTART dir=%u tgt=%u t=%lu\r\n",
+					cmd.dir, cmd.steps, HAL_GetTick());
 				stepper2_stop(); stepTarget2 = 0;
 				stepper2_start(dir, cmd.steps);
 				stepMode = true;
 			} else {
+				DPRINT("[S2] KEEPALIVE dir=%u steps=%u t=%lu\r\n",
+					cmd.dir, cmd.steps, HAL_GetTick());
 				HAL_GPIO_WritePin(DIR2_PORT, DIR2_PIN, dir);
 			}
 		}
@@ -605,27 +639,65 @@ static void canRxTask(void *arg) {
 				speed = STEPPER_SPEED_CRAWL;
 			if (dir > 3)
 				steps = 0;
+			/* Escape hatch: a fresh manual command always clears any sticky
+			 * emergency flag (in case PATH_CLEAR never arrives — e.g. table
+			 * is a permanent obstacle and operator drives away manually). */
+			if (g_emergencyStop) {
+				g_emergencyStop = false;
+				PRINT("[EMRG] cleared by MANUAL_MOVE\r\n");
+			}
 			NavCmd_t cmd = { dir, steps, speed };
 			xQueueOverwrite(stepQueue1, &cmd); /* latest command wins */
 			xQueueOverwrite(stepQueue2, &cmd);
-			PRINT("[CAN] dir=%u steps=%u t=%lu\r\n", dir, steps, HAL_GetTick());
+			// PRINT("[CAN] dir=%u steps=%u t=%lu\r\n", dir, steps, HAL_GetTick());
+			break;
+		}
+		case CAN_ID_EMERGENCY_STOP: {
+			/* MCU3 detected obstacle <15cm in front. Snapshot remaining work,
+			 * stop motors immediately, set flag so any in-flight MANUAL_MOVE
+			 * is replaced by a stop. */
+			uint32_t cur1 = motor1_steps;
+			uint32_t tgt1 = stepTarget1;
+			uint32_t cur2 = motor2_steps;
+			uint32_t tgt2 = stepTarget2;
+			uint32_t rem1 = (tgt1 > cur1) ? (tgt1 - cur1) : 0;
+			uint32_t rem2 = (tgt2 > cur2) ? (tgt2 - cur2) : 0;
+			g_savedRem1 = (rem1 > 0xFFFFU) ? 0xFFFFU : (uint16_t) rem1;
+			g_savedRem2 = (rem2 > 0xFFFFU) ? 0xFFFFU : (uint16_t) rem2;
+			/* g_savedDir/g_savedSpeed: best-effort capture — last MANUAL_MOVE
+			 * is unknown here; HTML/MCU1 retransmit on resume anyway.        */
+			g_emergencyStop = true;
+			NavCmd_t stop = { 0, 0, 0 };
+			xQueueOverwrite(stepQueue1, &stop);
+			xQueueOverwrite(stepQueue2, &stop);
+			PRINT("[EMRG] STOP rem1=%u rem2=%u\r\n", g_savedRem1, g_savedRem2);
+			break;
+		}
+		case CAN_ID_PATH_CLEAR: {
+			/* Path clear — only clear the sticky flag so subsequent
+			 * MANUAL_MOVE commands are accepted again. Do NOT auto-resume
+			 * (HTML drives the next leg explicitly).                    */
+			if (g_emergencyStop) {
+				g_emergencyStop = false;
+				PRINT("[EMRG] CLEAR (rem1=%u rem2=%u still pending)\r\n",
+						g_savedRem1, g_savedRem2);
+			}
 			break;
 		}
 		case CAN_ID_SAVE_CP: {
 			uint8_t cp_id = msg.data[0];
-//			PRINT("[CP] save id=%u\r\n", cp_id);
+			// PRINT("[CP] save id=%u\r\n", cp_id);
 			/* TODO: persist to flash_storage */
 			uint8_t ack[2] = { cp_id, 0 }; /* result 0 = success */
 			can_tx(CAN_ID_CP_SAVED_ACK, ack, 2);
 			break;
 		}
 		case CAN_ID_HEARTBEAT_MCU1:
-//			PRINT("[HB] cnt=%u\r\n", msg.data[0]);
+			// PRINT("[HB] cnt=%u\r\n", msg.data[0]);
 			break;
 		default:
-//			PRINT("[CAN-RX] id=0x%03lX len=%u  %02X %02X %02X %02X\r\n", msg.id,
-//					msg.len, msg.data[0], msg.data[1], msg.data[2],
-//					msg.data[3]);
+			// PRINT("[CAN-RX] id=0x%03lX len=%u  %02X %02X %02X %02X\r\n", msg.id,
+			// 		msg.len, msg.data[0], msg.data[1], msg.data[2], msg.data[3]);
 			break;
 		}
 	}

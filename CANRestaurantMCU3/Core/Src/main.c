@@ -9,14 +9,14 @@
 
 // ============================================================
 // PIN DEFINITIONS
-// PA6  = TRIG1 Front  (GPIO output)
-// PA7  = ECHO1 Front  (TIM2 CH3 input capture, AF1)
-// PA4  = TRIG2 Right  (GPIO output)
-// PA1  = ECHO2 Right  (TIM2 CH2 input capture, AF1)
-// PA5  = TRIG3 Left   (GPIO output)
-// PB0  = ECHO3 Left   (TIM3 CH3 input capture, AF2)
-// PB8  = TRIG4 Rear   (GPIO output)
-// PB1  = ECHO4 Rear   (TIM3 CH4 input capture, AF2)
+// PA6  = TRIG1 (unused — sensor 1 disabled)
+// PA7  = ECHO1 (unused)
+// PA4  = TRIG2 (unused)
+// PA1  = ECHO2 (unused)
+// PA5  = TRIG3 FRONT  (GPIO output)
+// PB0  = ECHO3 FRONT  (TIM3 CH3 input capture, AF2) <-- the only active sensor
+// PB8  = TRIG4 (unused — sensor 4 disabled)
+// PB1  = ECHO4 (unused)
 // PB10 = FDCAN1 TX (AF9)
 // PB12 = FDCAN1 RX (AF9)
 // PC13 = LED blink
@@ -39,8 +39,8 @@
 #define US_TO_CM                58.0f
 #define ECHO_TIMEOUT_US         38000
 
-// Obstacle threshold
-#define OBSTACLE_THRESHOLD_CM   10.0f
+// Obstacle threshold (cm) — front-only emergency stop
+#define OBSTACLE_THRESHOLD_CM   15.0f
 
 // ============================================================
 // CAN MESSAGE IDs
@@ -145,14 +145,6 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim) {
 			trigState2 = 1;
 			uint32_t nextCCR = __HAL_TIM_GET_COUNTER(htim) + TRIG_PULSE_US;
 			__HAL_TIM_SET_COMPARE(htim, TIM_CHANNEL_1, nextCCR);
-
-			// DEBUG: confirm TRIG2 (PA4) pulse is being sent
-			static uint32_t trig2Count = 0;
-			trig2Count++;
-			if (trig2Count % 50 == 0) { // print every 50 pulses to avoid flooding
-				printf("[DBG] TRIG2 pulse fired #%lu, PA4 state=%d\r\n",
-						trig2Count, HAL_GPIO_ReadPin(TRIG2_PORT, TRIG2_PIN));
-			}
 		} else {
 			HAL_GPIO_WritePin(TRIG1_PORT, TRIG1_PIN, GPIO_PIN_RESET);
 			HAL_GPIO_WritePin(TRIG2_PORT, TRIG2_PIN, GPIO_PIN_RESET);
@@ -329,40 +321,37 @@ static void sonarTask4(void *arg) {
 }
 
 // ============================================================
-// TASK 5: OBSTACLE ANALYSIS
+// TASK 5: OBSTACLE ANALYSIS  (FRONT-ONLY — sensor 3, PA5/PB0/TIM3 CH3)
 // ============================================================
 static void obstacleAnalysisTask(void *arg) {
 	(void) arg;
 	vTaskDelay(pdMS_TO_TICKS(300));
-	PRINT("[MCU3] Obstacle Analysis Task started\r\n");
+	PRINT("[MCU3] Obstacle Analysis Task started (FRONT only, threshold=%.0fcm)\r\n",
+			OBSTACLE_THRESHOLD_CM);
 
 	static uint8_t wasEmergency = 0;
-	float dist[4] = { 999.0f, 999.0f, 999.0f, 999.0f };
-	const char *name[4] = { "Right", "Left", "Front", "Rear" };
+	float distFront = 999.0f;
+	/* Drain other queues so they don't fill (sensors 1/2/4 may still publish). */
+	float scrap;
 
 	for (;;) {
-		xQueueReceive(obstacleQueue[0], &dist[0], portMAX_DELAY);
-		xQueueReceive(obstacleQueue[1], &dist[1], 0);
-		xQueueReceive(obstacleQueue[2], &dist[2], 0);
-		xQueueReceive(obstacleQueue[3], &dist[3], 0);
+		/* Block on FRONT sensor only — that's the obstacle source we trust. */
+		xQueueReceive(obstacleQueue[2], &distFront, portMAX_DELAY);
+		(void) xQueueReceive(obstacleQueue[0], &scrap, 0);
+		(void) xQueueReceive(obstacleQueue[1], &scrap, 0);
+		(void) xQueueReceive(obstacleQueue[3], &scrap, 0);
 
-		PRINT("[sonar] F:%.1f R:%.1f L:%.1f B:%.1f cm\r\n", dist[2], dist[0],
-				dist[1], dist[3]);
+		PRINT("[sonar] FRONT=%.1f cm\r\n", distFront);
 
-		uint8_t anyObstacle = 0;
-		for (int i = 0; i < 4; i++) {
-			if (dist[i] < OBSTACLE_THRESHOLD_CM) {
-				anyObstacle = 1;
-				PRINT("[MCU3] Obstacle %s: %.1f cm\r\n", name[i], dist[i]);
-			}
-		}
+		uint8_t obstacle = (distFront < OBSTACLE_THRESHOLD_CM) ? 1 : 0;
 
-		if (anyObstacle && !wasEmergency) {
+		if (obstacle && !wasEmergency) {
 			wasEmergency = 1;
 			xEventGroupSetBits(threatEventGroup, EMERGENCY_STOP_BIT);
-			PRINT("[MCU3] Obstacle! Setting EMERGENCY_STOP_BIT\r\n");
+			PRINT("[MCU3] FRONT obstacle %.1fcm -> EMERGENCY_STOP_BIT\r\n",
+					distFront);
 
-		} else if (!anyObstacle && wasEmergency) {
+		} else if (!obstacle && wasEmergency) {
 			wasEmergency = 0;
 			xSemaphoreGive(stopActiveSem);
 
@@ -370,7 +359,8 @@ static void obstacleAnalysisTask(void *arg) {
 			msg.id = CAN_ID_PATH_CLEAR;
 			msg.data[0] = 0xC1;
 			xQueueSend(canTxQueue, &msg, 0);
-			PRINT("[MCU3] Path clear - pushing 0x303 to canTxQueue\r\n");
+			PRINT("[MCU3] Front clear (%.1fcm) -> 0x303 PATH_CLEAR\r\n",
+					distFront);
 		}
 	}
 }

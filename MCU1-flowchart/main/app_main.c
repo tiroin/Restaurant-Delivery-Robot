@@ -167,6 +167,22 @@ static void canRxTask(void *arg)
             ESP_LOGI(TAG, "[canRx] echo from MCU3");
             break;
 
+        case 0x301: {  /* OBSTACLE_ALERT from MCU3 (data[0]=0xA1) — front sensor <15cm */
+            ESP_LOGW(TAG, "[canRx] >>> OBSTACLE 0x301 (front <15cm) <<<");
+            snprintf(ws_json, sizeof(ws_json),
+                     "{\"type\":\"obstacle\",\"state\":1}");
+            ble_robot_notify(ws_json);
+            break;
+        }
+
+        case 0x303: {  /* PATH_CLEAR from MCU3 (data[0]=0xC1) — front clear */
+            ESP_LOGI(TAG, "[canRx] >>> PATH_CLEAR 0x303 <<<");
+            snprintf(ws_json, sizeof(ws_json),
+                     "{\"type\":\"path_clear\",\"state\":0}");
+            ble_robot_notify(ws_json);
+            break;
+        }
+
         default:
             g_n_other++;
             g_last_other_id = rx.identifier;
