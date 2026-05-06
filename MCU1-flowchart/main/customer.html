@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Restaurant Order</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #f5f0e8; min-height: 100vh; padding: 16px; }
+  h1 { text-align: center; color: #7b3f00; font-size: 1.6rem; margin-bottom: 4px; }
+  .subtitle { text-align: center; color: #888; font-size: 0.85rem; margin-bottom: 20px; }
+
+  .screen { display: none; }
+  .screen.active { display: block; }
+
+  /* Table selection */
+  #table-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+                gap: 12px; margin-top: 8px; }
+  .table-btn { background: #fff; border: 2px solid #d4a55a; border-radius: 12px;
+               padding: 18px 8px; text-align: center; cursor: pointer;
+               font-size: 1rem; font-weight: 600; color: #7b3f00;
+               transition: background 0.15s, transform 0.1s; }
+  .table-btn:active { background: #fde8c0; transform: scale(0.96); }
+  .table-btn.selected { background: #f4a933; border-color: #c77d00; color: #fff; }
+
+  /* Menu */
+  #menu-table-name { text-align: center; font-size: 1.1rem; font-weight: 600;
+                     color: #7b3f00; margin-bottom: 16px; }
+  .category { margin-bottom: 16px; }
+  .category h3 { font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.05em;
+                 color: #aaa; margin-bottom: 8px; border-bottom: 1px solid #e0d4b8; padding-bottom: 4px; }
+  .item-row { display: flex; align-items: center; justify-content: space-between;
+              background: #fff; border-radius: 10px; padding: 12px 14px; margin-bottom: 8px;
+              cursor: pointer; border: 2px solid transparent; }
+  .item-row.checked { border-color: #f4a933; background: #fffbf0; }
+  .item-label { font-size: 0.95rem; color: #333; flex: 1; }
+  .item-price { font-size: 0.85rem; color: #888; margin-right: 10px; }
+  .item-check { width: 24px; height: 24px; border-radius: 50%; border: 2px solid #ccc;
+                background: #fff; flex-shrink: 0; display: flex; align-items: center;
+                justify-content: center; font-size: 0.8rem; }
+  .item-row.checked .item-check { background: #f4a933; border-color: #f4a933; color: #fff; }
+
+  /* Buttons */
+  .btn { width: 100%; padding: 14px; border-radius: 10px; border: none;
+         font-size: 1rem; font-weight: 600; cursor: pointer; margin-top: 12px; }
+  .btn-primary { background: #f4a933; color: #fff; }
+  .btn-primary:active { background: #c97d00; }
+  .btn-secondary { background: #eee; color: #555; }
+  .btn-primary:disabled { background: #ccc; cursor: default; }
+  .back-link { display: block; text-align: center; margin-top: 16px;
+               color: #888; font-size: 0.85rem; cursor: pointer; text-decoration: underline; }
+
+  /* Confirmation */
+  #confirm-screen { text-align: center; padding-top: 40px; }
+  .checkmark { font-size: 4rem; margin-bottom: 16px; }
+  #confirm-screen h2 { color: #2e7d32; font-size: 1.4rem; margin-bottom: 8px; }
+  #confirm-detail { color: #555; margin-bottom: 24px; line-height: 1.5; }
+
+  /* Loading */
+  #loading { text-align: center; padding: 40px 0; color: #888; }
+
+  /* Empty tables */
+  #no-tables { text-align: center; padding: 30px; color: #aaa; }
+</style>
+</head>
+<body>
+<h1>&#127869; Restaurant</h1>
+<p class="subtitle">Welcome! Please place your order below.</p>
+
+<!-- Screen 1: Table selection -->
+<div id="screen-tables" class="screen active">
+  <div id="loading">Loading tables...</div>
+  <div id="table-grid" style="display:none"></div>
+  <div id="no-tables" style="display:none">No tables configured yet.<br>Please ask the staff.</div>
+  <button class="btn btn-primary" id="btn-select-table" disabled onclick="goToMenu()">Next &rarr;</button>
+</div>
+
+<!-- Screen 2: Menu -->
+<div id="screen-menu" class="screen">
+  <p id="menu-table-name"></p>
+  <div id="menu-items"></div>
+  <button class="btn btn-primary" id="btn-submit" disabled onclick="submitOrder()">Place Order</button>
+  <span class="back-link" onclick="goBack()">&#8592; Change table</span>
+</div>
+
+<!-- Screen 3: Confirmation -->
+<div id="confirm-screen" class="screen">
+  <div class="checkmark">&#10003;</div>
+  <h2>Order Placed!</h2>
+  <p id="confirm-detail"></p>
+  <button class="btn btn-secondary" onclick="startOver()">Order Again</button>
+</div>
+
+<script>
+  /* ── Menu definition ─────────────────────────── */
+  const MENU = [
+    { cat: "Main Dishes", items: [
+        { name: "Pho Bo (Beef Noodle Soup)" },
+        { name: "Com Tam (Broken Rice with Pork)" },
+        { name: "Banh Mi (Vietnamese Baguette)" },
+        { name: "Bun Bo Hue (Spicy Beef Noodle)" },
+    ]},
+    { cat: "Appetizers", items: [
+        { name: "Goi Cuon (Fresh Spring Rolls)" },
+        { name: "Cha Gio (Fried Spring Rolls)" },
+    ]},
+    { cat: "Drinks", items: [
+        { name: "Ca Phe Sua Da (Iced Milk Coffee)" },
+        { name: "Nuoc Chanh (Lemonade)" },
+        { name: "Tra Da (Iced Tea)" },
+    ]},
+  ];
+
+  let selectedTable = null;
+  let checkedItems  = new Set();
+
+  /* ── Load tables ─────────────────────────── */
+  async function loadTables() {
+    try {
+      const r = await fetch('/api/tables');
+      const d = await r.json();
+      const tables = d.tables || [];
+      document.getElementById('loading').style.display = 'none';
+      if (tables.length === 0) {
+        document.getElementById('no-tables').style.display = 'block';
+        return;
+      }
+      const grid = document.getElementById('table-grid');
+      grid.style.display = 'grid';
+      grid.innerHTML = '';
+      tables.forEach(t => {
+        const b = document.createElement('div');
+        b.className = 'table-btn';
+        b.textContent = t;
+        b.dataset.name = t;
+        b.onclick = () => selectTable(b, t);
+        grid.appendChild(b);
+      });
+    } catch(e) {
+      document.getElementById('loading').textContent = 'Could not load tables. Please refresh.';
+    }
+  }
+
+  function selectTable(el, name) {
+    document.querySelectorAll('.table-btn').forEach(b => b.classList.remove('selected'));
+    el.classList.add('selected');
+    selectedTable = name;
+    document.getElementById('btn-select-table').disabled = false;
+  }
+
+  function goToMenu() {
+    if (!selectedTable) return;
+    document.getElementById('menu-table-name').textContent = selectedTable;
+    checkedItems.clear();
+
+    const container = document.getElementById('menu-items');
+    container.innerHTML = '';
+    MENU.forEach(cat => {
+      const section = document.createElement('div');
+      section.className = 'category';
+      section.innerHTML = '<h3>' + cat.cat + '</h3>';
+      cat.items.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'item-row';
+        row.innerHTML = '<span class="item-label">' + item.name + '</span>' +
+                        '<div class="item-check">&#10003;</div>';
+        row.onclick = () => toggleItem(row, item.name);
+        section.appendChild(row);
+      });
+      container.appendChild(section);
+    });
+
+    showScreen('screen-menu');
+  }
+
+  function toggleItem(row, name) {
+    if (checkedItems.has(name)) {
+      checkedItems.delete(name);
+      row.classList.remove('checked');
+    } else {
+      checkedItems.add(name);
+      row.classList.add('checked');
+    }
+    document.getElementById('btn-submit').disabled = checkedItems.size === 0;
+  }
+
+  function goBack() {
+    showScreen('screen-tables');
+  }
+
+  async function submitOrder() {
+    const btn = document.getElementById('btn-submit');
+    btn.disabled = true;
+    btn.textContent = 'Sending...';
+
+    const items = Array.from(checkedItems).join(', ');
+    try {
+      const r = await fetch('/api/order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ table: selectedTable, items: items }),
+      });
+      const d = await r.json();
+      if (d.ok) {
+        document.getElementById('confirm-detail').innerHTML =
+          '<strong>' + selectedTable + '</strong><br>' + items;
+        showScreen('confirm-screen');
+      } else {
+        alert('Order failed. Please try again.');
+        btn.disabled = false;
+        btn.textContent = 'Place Order';
+      }
+    } catch(e) {
+      alert('Network error. Please try again.');
+      btn.disabled = false;
+      btn.textContent = 'Place Order';
+    }
+  }
+
+  function startOver() {
+    selectedTable = null;
+    checkedItems.clear();
+    document.getElementById('btn-select-table').disabled = true;
+    document.querySelectorAll('.table-btn').forEach(b => b.classList.remove('selected'));
+    showScreen('screen-tables');
+  }
+
+  function showScreen(id) {
+    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+  }
+
+  loadTables();
+</script>
+</body>
+</html>

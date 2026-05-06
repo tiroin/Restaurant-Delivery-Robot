@@ -22,18 +22,70 @@
 
 #include "wifi_ap_ws.h"
 #include "robot_types.h"
+#include "ble_robot.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "WSAP";
 
 /* ── AP credentials ─────────────────────────── */
-#define AP_SSID         "RobotControl"
-#define AP_PASS         "robot1234"
+#define AP_SSID         "RestaurantGroup3"
+#define AP_PASS         "123123@@@"
 #define AP_CHANNEL      6
-#define AP_MAX_CONN     4
+#define AP_MAX_CONN     10
 
-/* ── Embedded HTML (index.html, registered in CMakeLists.txt) ── */
-extern const uint8_t index_html_start[] asm("_binary_index_html_start");
-extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
+/* ── Embedded HTML pages ─────────────────────── */
+extern const uint8_t index_html_start[]    asm("_binary_index_html_start");
+extern const uint8_t index_html_end[]      asm("_binary_index_html_end");
+extern const uint8_t customer_html_start[] asm("_binary_customer_html_start");
+extern const uint8_t customer_html_end[]   asm("_binary_customer_html_end");
+
+/* ── Order queue ─────────────────────────────── */
+#define MAX_ORDERS      20
+#define MAX_TABLE_NAME  16
+#define MAX_TABLES      20
+#define MAX_ITEMS_LEN   200
+
+typedef struct {
+    uint32_t id;                    /* monotonic order id */
+    char     table[MAX_TABLE_NAME]; /* e.g. "Table 1" */
+    char     items[MAX_ITEMS_LEN];  /* comma-joined items */
+    uint32_t ts;                    /* xTaskGetTickCount() at submission */
+    uint8_t  status;                /* 0=pending, 1=delivered */
+} customer_order_t;
+
+static customer_order_t s_orders[MAX_ORDERS];
+static int          s_order_count  = 0;
+static uint32_t     s_order_next_id = 1;
+static SemaphoreHandle_t s_order_mutex = NULL;
+
+/* ── Table list (NVS-backed) ─────────────────── */
+#define NVS_NS_TABLES   "tables"
+#define NVS_KEY_LIST    "list"
+
+static char s_tables_json[512] = "{\"tables\":[]}"; /* default empty */
+static SemaphoreHandle_t s_tables_mutex = NULL;
+
+/* Load table list from NVS into s_tables_json */
+static void tables_load_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_TABLES, NVS_READONLY, &h) != ESP_OK) return;
+    size_t len = sizeof(s_tables_json) - 1;
+    nvs_get_str(h, NVS_KEY_LIST, s_tables_json, &len);
+    nvs_close(h);
+}
+
+/* Save current s_tables_json to NVS */
+static void tables_save_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_TABLES, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, NVS_KEY_LIST, s_tables_json);
+    nvs_commit(h);
+    nvs_close(h);
+}
 
 /* ── HTTP server handle ──────────────────────── */
 static httpd_handle_t s_server = NULL;
@@ -135,13 +187,32 @@ static void handle_ws_message(const char *msg)
         uint8_t data[1] = { (uint8_t)json_get_int(msg, "mode", 0) };
         can_tx(CAN_ID_SET_MODE, data, sizeof(data));
 
+    } else if (strcmp(cmd, "set_tables") == 0) {
+        /* {"cmd":"set_tables","tables":["Table 1","Table 2",...]} */
+        /* Find the "tables" array in the JSON and store it */
+        const char *arr = strstr(msg, "\"tables\":");
+        if (arr) {
+            arr += strlen("\"tables\":");
+            while (*arr == ' ' || *arr == '\t') arr++;
+            /* Build JSON object {"tables":[...]} */
+            xSemaphoreTake(s_tables_mutex, portMAX_DELAY);
+            snprintf(s_tables_json, sizeof(s_tables_json), "{\"tables\":%s}", arr);
+            /* Trim trailing brace from original msg that may follow the array */
+            /* Find the closing ] and null-terminate the JSON object properly */
+            char *end = strchr(s_tables_json, ']');
+            if (end) { end[1] = '}'; end[2] = '\0'; }
+            xSemaphoreGive(s_tables_mutex);
+            tables_save_nvs();
+            ESP_LOGI(TAG, "Tables updated: %s", s_tables_json);
+        }
+
     } else {
         ESP_LOGW(TAG, "Unknown WS cmd: %s", cmd);
     }
 }
 
 /* ══════════════════════════════════════════════
- *  HTTP GET / — serve embedded HTML page
+ *  HTTP GET / — serve staff HTML page
  * ══════════════════════════════════════════════ */
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
@@ -149,6 +220,117 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     size_t len = (size_t)(index_html_end - index_html_start);
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_send(req, (const char *)index_html_start, (ssize_t)len);
+    return ESP_OK;
+}
+
+/* ══════════════════════════════════════════════
+ *  HTTP GET /customer — serve customer ordering page
+ * ══════════════════════════════════════════════ */
+static esp_err_t customer_get_handler(httpd_req_t *req)
+{
+    size_t len = (size_t)(customer_html_end - customer_html_start);
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_send(req, (const char *)customer_html_start, (ssize_t)len);
+    return ESP_OK;
+}
+
+/* ══════════════════════════════════════════════
+ *  HTTP GET /api/tables — return table list JSON
+ * ══════════════════════════════════════════════ */
+static esp_err_t api_tables_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    xSemaphoreTake(s_tables_mutex, portMAX_DELAY);
+    httpd_resp_sendstr(req, s_tables_json);
+    xSemaphoreGive(s_tables_mutex);
+    return ESP_OK;
+}
+
+/* ══════════════════════════════════════════════
+ *  HTTP GET /api/orders — return pending orders JSON
+ * ══════════════════════════════════════════════ */
+static esp_err_t api_orders_get_handler(httpd_req_t *req)
+{
+    char buf[1024];
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "{\"orders\":[");
+
+    xSemaphoreTake(s_order_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_order_count && pos < (int)sizeof(buf) - 80; i++) {
+        if (i > 0) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "{\"id\":%" PRIu32 ",\"table\":\"%s\",\"items\":\"%s\",\"ts\":%" PRIu32 ",\"status\":%d}",
+            s_orders[i].id, s_orders[i].table, s_orders[i].items,
+            s_orders[i].ts, s_orders[i].status);
+    }
+    xSemaphoreGive(s_order_mutex);
+
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+/* ══════════════════════════════════════════════
+ *  HTTP POST /api/order — submit an order
+ *  Body: {"table":"Table 1","items":"Pho, Spring Roll"}
+ * ══════════════════════════════════════════════ */
+static esp_err_t api_order_post_handler(httpd_req_t *req)
+{
+    /* Read body (max 512 bytes) */
+    char body[512];
+    int  total = req->content_len < (int)sizeof(body) - 1
+                  ? req->content_len : (int)sizeof(body) - 1;
+    int  recv  = 0;
+    while (recv < total) {
+        int r = httpd_req_recv(req, body + recv, total - recv);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Read error");
+            return ESP_FAIL;
+        }
+        recv += r;
+    }
+    body[recv] = '\0';
+
+    /* Parse table and items */
+    char table[MAX_TABLE_NAME] = {0};
+    char items[MAX_ITEMS_LEN]  = {0};
+    json_get_str(body, "table", table, sizeof(table));
+    json_get_str(body, "items", items, sizeof(items));
+
+    if (table[0] == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing table");
+        return ESP_FAIL;
+    }
+
+    /* Enqueue order */
+    xSemaphoreTake(s_order_mutex, portMAX_DELAY);
+    uint32_t oid = s_order_next_id++;
+    if (s_order_count < MAX_ORDERS) {
+        customer_order_t *o = &s_orders[s_order_count++];
+        o->id     = oid;
+        o->ts     = (uint32_t)xTaskGetTickCount();
+        o->status = 0;
+        strlcpy(o->table, table, sizeof(o->table));
+        strlcpy(o->items, items, sizeof(o->items));
+    }
+    xSemaphoreGive(s_order_mutex);
+
+    /* Notify staff via BLE */
+    char notify[320];
+    snprintf(notify, sizeof(notify),
+        "{\"type\":\"order\",\"id\":%" PRIu32 ",\"table\":\"%s\",\"items\":\"%s\"}",
+        oid, table, items);
+    ble_robot_notify(notify);
+    /* Also broadcast to any connected staff WS client */
+    wifi_ap_ws_broadcast(notify);
+
+    /* Respond */
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"id\":%" PRIu32 "}", oid);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    ESP_LOGI(TAG, "[ORDER] #%" PRIu32 " table=%s items=%s", oid, table, items);
     return ESP_OK;
 }
 
@@ -275,9 +457,10 @@ esp_err_t wifi_ap_ws_broadcast(const char *json_str)
 static esp_err_t start_webserver(void)
 {
     httpd_config_t config   = HTTPD_DEFAULT_CONFIG();
-    config.max_open_sockets = 7;
+    config.max_open_sockets = 10;
     config.stack_size       = 8192;
     config.lru_purge_enable = true;
+    config.uri_match_fn     = httpd_uri_match_wildcard;
 
     ESP_RETURN_ON_ERROR(httpd_start(&s_server, &config),
                         TAG, "httpd_start failed");
@@ -297,7 +480,35 @@ static esp_err_t start_webserver(void)
     };
     httpd_register_uri_handler(s_server, &ws_uri);
 
-    ESP_LOGI(TAG, "HTTP server on :80  WS on /ws");
+    static const httpd_uri_t customer_uri = {
+        .uri     = "/customer",
+        .method  = HTTP_GET,
+        .handler = customer_get_handler,
+    };
+    httpd_register_uri_handler(s_server, &customer_uri);
+
+    static const httpd_uri_t api_tables_uri = {
+        .uri     = "/api/tables",
+        .method  = HTTP_GET,
+        .handler = api_tables_get_handler,
+    };
+    httpd_register_uri_handler(s_server, &api_tables_uri);
+
+    static const httpd_uri_t api_orders_uri = {
+        .uri     = "/api/orders",
+        .method  = HTTP_GET,
+        .handler = api_orders_get_handler,
+    };
+    httpd_register_uri_handler(s_server, &api_orders_uri);
+
+    static const httpd_uri_t api_order_post_uri = {
+        .uri     = "/api/order",
+        .method  = HTTP_POST,
+        .handler = api_order_post_handler,
+    };
+    httpd_register_uri_handler(s_server, &api_order_post_uri);
+
+    ESP_LOGI(TAG, "HTTP server on :80  WS /ws  Customer /customer  API /api/*");
     return ESP_OK;
 }
 
@@ -327,6 +538,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
  * ══════════════════════════════════════════════ */
 esp_err_t wifi_ap_ws_init(void)
 {
+    /* Init mutexes and load saved table list */
+    s_order_mutex  = xSemaphoreCreateMutex();
+    s_tables_mutex = xSemaphoreCreateMutex();
+    tables_load_nvs();
+
     /* Create default AP netif (provides DHCP server + lwIP AP interface) */
     esp_netif_create_default_wifi_ap();
 

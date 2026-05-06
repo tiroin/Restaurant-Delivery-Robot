@@ -176,6 +176,28 @@ select.rsel{width:100%;padding:7px 9px;border:1.5px solid #e0e0e0;border-radius:
       <button class="rbtn R"    onclick="cancelDelivery()" id="cancelDelvBtn">&#10005; Cancel</button>
     </div>
     <div id="planInfo" style="font-size:.6rem;color:#444;margin-top:6px;white-space:pre-wrap;background:#f5f5f7;border-radius:6px;padding:5px 7px;min-height:18px">Pick tables and click Plan + Deliver</div>
+
+    <div style="margin-top:10px;border-top:1px solid #e0e0e0;padding-top:8px">
+      <div style="font-size:.65rem;color:#666;margin-bottom:5px">Customer Ordering (WiFi: <b>RestaurantGroup3</b> &rarr; 192.168.4.1/customer)</div>
+      <button class="rbtn" onclick="syncTables()" id="syncTablesBtn">&#8679; Sync Tables to Robot</button>
+      <div id="syncTablesInfo" style="font-size:.6rem;color:#888;margin-top:4px"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ORDERS PANEL -->
+<div class="card" id="ordersCard">
+  <div class="card-title dbg-hdr">
+    Customer Orders
+    <span style="display:flex;gap:6px;align-items:center">
+      <span id="ordersBadge" style="background:#e53935;color:#fff;border-radius:10px;padding:1px 7px;font-size:.7rem;display:none">0</span>
+      <button class="minibtn" onclick="clearOrders()">Clear</button>
+      <button class="minibtn" id="ordersToggleBtn" onclick="toggleOrders()">Hide</button>
+    </span>
+  </div>
+  <div id="ordersBody">
+    <div id="ordersList" style="font-size:.75rem;color:#444"></div>
+    <div id="ordersEmpty" style="font-size:.7rem;color:#aaa;text-align:center;padding:10px 0">No orders yet</div>
   </div>
 </div>
 
@@ -620,6 +642,8 @@ function onBleNotify(event) {
     onAckCP(d.cp_id, d.result);
   } else if (d.type === 'odo') {
     onOdometry(d.dir, d.s1, d.s2);
+  } else if (d.type === 'order') {
+    onOrder(d);
   } else {
     dbgEvent('ble-unknown', JSON.stringify(d).substring(0,60));
   }
@@ -1110,6 +1134,81 @@ function returnHome() {
     setSt('Home ✓  (drive completed — tap "Mark Home" if position is confirmed)');
     updateInfo();
   });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CUSTOMER ORDERING — Sync table list + receive orders
+   ─────────────────────────────────────────────────────────────────────
+   syncTables(): reads gnodes, filters type==="table", sends BLE cmd
+   onOrder(d): called when type:"order" arrives via BLE notify
+   ═══════════════════════════════════════════════════════════════════════ */
+var allOrders = [];
+var ordersHidden = false;
+
+function syncTables() {
+  var tables = Object.keys(gnodes).filter(function(k){ return gnodes[k]==='table'; });
+  if (tables.length === 0) {
+    document.getElementById('syncTablesInfo').textContent = 'No nodes marked as "table" yet. Tap nodes in the graph to set their type.';
+    return;
+  }
+  send({cmd:'set_tables', tables: tables});
+  document.getElementById('syncTablesInfo').textContent = 'Synced ' + tables.length + ' table(s): ' + tables.join(', ');
+  dbgEvent('sync-tables', tables.join(', '), 'G');
+}
+
+function onOrder(d) {
+  var o = { id: d.id||0, table: d.table||'?', items: d.items||'', ts: Date.now() };
+  allOrders.unshift(o);
+  renderOrders();
+  dbgEvent('order', '#'+o.id+' '+o.table+': '+o.items, 'G');
+}
+
+function renderOrders() {
+  var list = document.getElementById('ordersList');
+  var empty = document.getElementById('ordersEmpty');
+  var badge = document.getElementById('ordersBadge');
+  var pending = allOrders.filter(function(o){ return !o.done; });
+  badge.textContent = pending.length;
+  badge.style.display = pending.length > 0 ? '' : 'none';
+  if (allOrders.length === 0) {
+    list.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+  list.innerHTML = allOrders.map(function(o, i) {
+    var t = new Date(o.ts);
+    var time = t.getHours().toString().padStart(2,'0')+':'+t.getMinutes().toString().padStart(2,'0');
+    return '<div style="background:'+(o.done?'#f5f5f5':'#fffbf0')+';border-radius:8px;padding:8px 10px;margin-bottom:6px;border-left:3px solid '+(o.done?'#ccc':'#f4a933')+'">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center">'
+      + '<b>' + escHtml(o.table) + '</b>'
+      + '<span style="font-size:.65rem;color:#aaa">' + time + '</span>'
+      + '</div>'
+      + '<div style="color:#555;margin:2px 0 4px">' + escHtml(o.items) + '</div>'
+      + (o.done
+        ? '<span style="font-size:.65rem;color:#aaa">&#10003; Delivered</span>'
+        : '<button class="minibtn" style="font-size:.6rem" onclick="markDelivered('+i+')">&#10003; Delivered</button>')
+      + '</div>';
+  }).join('');
+}
+
+function markDelivered(i) {
+  if (allOrders[i]) { allOrders[i].done = true; renderOrders(); }
+}
+
+function clearOrders() {
+  allOrders = [];
+  renderOrders();
+}
+
+function toggleOrders() {
+  ordersHidden = !ordersHidden;
+  document.getElementById('ordersBody').style.display = ordersHidden ? 'none' : '';
+  document.getElementById('ordersToggleBtn').textContent = ordersHidden ? 'Show' : 'Hide';
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
