@@ -317,6 +317,20 @@ static bool emrgQ_push(NavCmd_t cmd) {
 	taskEXIT_CRITICAL();
 	return ok;
 }
+/* Push to front (head) — used by 0x302 so the current leg's remainder
+ * is replayed FIRST, even if earlier queued legs are already waiting. */
+static bool emrgQ_push_front(NavCmd_t cmd) {
+	bool ok = false;
+	taskENTER_CRITICAL();
+	if (g_emrgQCount < EMRG_QDEPTH) {
+		g_emrgQHead = (uint8_t)((g_emrgQHead + EMRG_QDEPTH - 1U) % EMRG_QDEPTH);
+		g_emrgQ[g_emrgQHead] = cmd;
+		g_emrgQCount++;
+		ok = true;
+	}
+	taskEXIT_CRITICAL();
+	return ok;
+}
 static bool emrgQ_pop(NavCmd_t *out) {
 	bool ok = false;
 	taskENTER_CRITICAL();
@@ -336,14 +350,18 @@ static void emrgQ_clear(void) {
 	taskEXIT_CRITICAL();
 }
 /* Pop the next pending leg (if any) and dispatch to stepper queues.
- * Used by 0x303 to kick off replay and by stepperTask1 to chain the
- * next leg after each completion. No-op while emergency is active. */
+ * Also updates g_curDir/g_curSpeed so a subsequent 0x302 (obstacle
+ * detected mid-replay) can correctly snapshot the in-flight remainder.
+ * No-op while emergency is active (caller must clear flag first).     */
 static void emrgQ_advance(const char *why) {
 	if (g_emergencyStop)
 		return;
 	NavCmd_t cmd;
 	if (!emrgQ_pop(&cmd))
 		return;
+	/* Track so 0x302 knows the current direction/speed during replay. */
+	g_curDir   = cmd.dir;
+	g_curSpeed = cmd.speed;
 	xQueueOverwrite(stepQueue1, &cmd);
 	xQueueOverwrite(stepQueue2, &cmd);
 	PRINT("[EMRG] %s -> replay dir=%u steps=%u (q=%u left)\r\n",
@@ -730,9 +748,11 @@ static void canRxTask(void *arg) {
 			break;
 		}
 		case CAN_ID_EMERGENCY_STOP: {
-			/* MCU3 detected obstacle <15cm in front. Capture the in-flight
-			 * leg's remaining steps as the FIRST entry in the replay FIFO,
-			 * stop motors immediately, set the lock flag.                  */
+			/* MCU3 detected obstacle <15cm. Snapshot the in-flight leg's
+			 * remaining steps and push it to the FRONT of the replay FIFO
+			 * (so it is replayed first, before any already-queued legs).
+			 * This also handles a second obstacle arriving during replay:
+			 * the partially-done replay leg goes back to head correctly.  */
 			uint32_t cur1 = motor1_steps;
 			uint32_t tgt1 = stepTarget1;
 			uint32_t cur2 = motor2_steps;
@@ -748,7 +768,7 @@ static void canRxTask(void *arg) {
 				uint16_t rem16 = (rem > 0xFFFFU) ? 0xFFFFU : (uint16_t) rem;
 				uint16_t spd = g_curSpeed ? g_curSpeed : STEPPER_SPEED_CRAWL;
 				NavCmd_t leg = { g_curDir, rem16, spd };
-				(void) emrgQ_push(leg); /* head of replay queue */
+				(void) emrgQ_push_front(leg); /* remainder always goes to head */
 				PRINT("[EMRG] STOP rem=%u dir=%u (q=%u)\r\n", rem16,
 						g_curDir, g_emrgQCount);
 			} else {
