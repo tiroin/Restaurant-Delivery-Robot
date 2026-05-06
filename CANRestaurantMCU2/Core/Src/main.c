@@ -639,12 +639,17 @@ static void canRxTask(void *arg) {
 				speed = STEPPER_SPEED_CRAWL;
 			if (dir > 3)
 				steps = 0;
-			/* Escape hatch: a fresh manual command always clears any sticky
-			 * emergency flag (in case PATH_CLEAR never arrives — e.g. table
-			 * is a permanent obstacle and operator drives away manually). */
+			/* While emergency is active, REJECT forward/turn moves so the
+			 * HTML's continuous leg-streaming cannot defeat the stop.
+			 * Only PATH_CLEAR (0x303) from MCU3 lifts the lock — that fires
+			 * automatically when the front sensor reads >= 15 cm again. */
 			if (g_emergencyStop) {
-				g_emergencyStop = false;
-				PRINT("[EMRG] cleared by MANUAL_MOVE\r\n");
+				NavCmd_t stop = { 0, 0, 0 };
+				xQueueOverwrite(stepQueue1, &stop);
+				xQueueOverwrite(stepQueue2, &stop);
+				PRINT("[EMRG] DROP MANUAL_MOVE dir=%u steps=%u (stop held)\r\n",
+						dir, steps);
+				break;
 			}
 			NavCmd_t cmd = { dir, steps, speed };
 			xQueueOverwrite(stepQueue1, &cmd); /* latest command wins */
