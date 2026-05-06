@@ -1612,6 +1612,8 @@ function runNextLeg() {
           if (!o.done && o.table === arrivedAt) { o.done = true; marked++; }
         });
         if (marked > 0) renderOrders();
+        /* Tell ESP32 to mark orders delivered so /api/tables shows table as free */
+        send({cmd:'order_delivered', table: arrivedAt});
         runNextLeg();
       }, 50);
     } else {

@@ -56,6 +56,12 @@ esp_err_t wifi_ap_ws_broadcast(const char *json_str);
  */
 void wifi_ap_ws_set_tables(const char *tables_array);
 
+/**
+ * @brief Mark all pending orders for a table as delivered (status=1).
+ *        Called from BLE cmd handler when cmd=order_delivered arrives.
+ */
+void wifi_ap_ws_mark_delivered(const char *table);
+
 #ifdef __cplusplus
 }
 #endif

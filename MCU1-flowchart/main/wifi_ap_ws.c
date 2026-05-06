@@ -228,6 +228,19 @@ static esp_err_t customer_get_handler(httpd_req_t *req)
 /* ══════════════════════════════════════════════
  *  HTTP GET /api/tables — return table list JSON
  * ══════════════════════════════════════════════ */
+void wifi_ap_ws_mark_delivered(const char *table)
+{
+    xSemaphoreTake(s_order_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_order_count; i++) {
+        if (s_orders[i].status == 0 &&
+            strncmp(s_orders[i].table, table, MAX_TABLE_NAME) == 0) {
+            s_orders[i].status = 1;
+        }
+    }
+    xSemaphoreGive(s_order_mutex);
+    ESP_LOGI(TAG, "Mark delivered: table=%s", table);
+}
+
 void wifi_ap_ws_set_tables(const char *tables_array)
 {
     /* tables_array is a JSON array like ["T1","T2","T3"] possibly with trailing garbage */
@@ -243,10 +256,47 @@ void wifi_ap_ws_set_tables(const char *tables_array)
 
 static esp_err_t api_tables_get_handler(httpd_req_t *req)
 {
-    httpd_resp_set_type(req, "application/json");
+    /* Build {"tables":[...],"occupied":[...]} */
+    char buf[640];
+    int pos = 0;
+
+    /* Copy base tables JSON (already has {"tables":[...]}) */
     xSemaphoreTake(s_tables_mutex, portMAX_DELAY);
-    httpd_resp_sendstr(req, s_tables_json);
+    /* Find the closing } to insert occupied array before it */
+    char base[512];
+    strncpy(base, s_tables_json, sizeof(base) - 1);
+    base[sizeof(base) - 1] = '\0';
     xSemaphoreGive(s_tables_mutex);
+
+    /* Strip trailing } to append occupied */
+    char *close = strrchr(base, '}');
+    if (close) *close = '\0';
+    pos = snprintf(buf, sizeof(buf), "%s,\"occupied\":", base);
+
+    /* Collect occupied tables (those with at least one pending order) */
+    xSemaphoreTake(s_order_mutex, portMAX_DELAY);
+    char seen[MAX_ORDERS][MAX_TABLE_NAME];
+    int  seen_count = 0;
+    bool first = true;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "[");
+    for (int i = 0; i < s_order_count; i++) {
+        if (s_orders[i].status != 0) continue;
+        /* Check not already added */
+        bool dup = false;
+        for (int j = 0; j < seen_count; j++) {
+            if (strcmp(seen[j], s_orders[i].table) == 0) { dup = true; break; }
+        }
+        if (dup) continue;
+        strncpy(seen[seen_count++], s_orders[i].table, MAX_TABLE_NAME - 1);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"%s\"",
+                        first ? "" : ",", s_orders[i].table);
+        first = false;
+    }
+    xSemaphoreGive(s_order_mutex);
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
     return ESP_OK;
 }
 

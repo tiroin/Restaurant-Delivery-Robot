@@ -142,6 +142,13 @@ static void handle_command(const char *msg)
             while (*arr == ' ' || *arr == '\t') arr++;
             wifi_ap_ws_set_tables(arr);
         }
+
+    } else if (strcmp(cmd, "order_delivered") == 0) {
+        /* Mark all pending orders for this table as delivered */
+        char table[32] = {0};
+        if (json_get_str(msg, "table", table, sizeof(table))) {
+            wifi_ap_ws_mark_delivered(table);
+        }
     }
 }
 

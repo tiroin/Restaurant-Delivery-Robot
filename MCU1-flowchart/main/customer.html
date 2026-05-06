@@ -23,6 +23,11 @@
                transition: background 0.15s, transform 0.1s; }
   .table-btn:active { background: #fde8c0; transform: scale(0.96); }
   .table-btn.selected { background: #f4a933; border-color: #c77d00; color: #fff; }
+  .table-btn.occupied { background: #f0f0f0; border-color: #ccc; color: #bbb;
+                        cursor: not-allowed; position: relative; }
+  .table-btn.occupied::after { content: 'Occupied'; display: block;
+                               font-size: 0.65rem; font-weight: 400;
+                               color: #e05a00; margin-top: 4px; }
 
   /* Menu */
   #menu-table-name { text-align: center; font-size: 1.1rem; font-weight: 600;
@@ -120,7 +125,8 @@
     try {
       const r = await fetch('/api/tables');
       const d = await r.json();
-      const tables = d.tables || [];
+      const tables   = d.tables   || [];
+      const occupied = new Set(d.occupied || []);
       document.getElementById('loading').style.display = 'none';
       if (tables.length === 0) {
         document.getElementById('no-tables').style.display = 'block';
@@ -131,10 +137,11 @@
       grid.innerHTML = '';
       tables.forEach(t => {
         const b = document.createElement('div');
-        b.className = 'table-btn';
+        const isOccupied = occupied.has(t);
+        b.className = 'table-btn' + (isOccupied ? ' occupied' : '');
         b.textContent = t;
         b.dataset.name = t;
-        b.onclick = () => selectTable(b, t);
+        if (!isOccupied) b.onclick = () => selectTable(b, t);
         grid.appendChild(b);
       });
     } catch(e) {
