@@ -27,6 +27,7 @@
 
 #include "ble_robot.h"
 #include "robot_types.h"
+#include "wifi_ap_ws.h"
 
 /* ── Pin definitions ───────────────────────── */
 #define PIN_SDA     21
@@ -424,6 +425,9 @@ void app_main(void)
 
     /* Start BLE GATT peripheral */
     ESP_ERROR_CHECK(ble_robot_init());
+
+    /* Start WiFi AP + HTTP/WS server */
+    wifi_ap_ws_init();
 
     oledQueue = xQueueCreate(1, sizeof(oled_msg_t));
     configASSERT(oledQueue);
