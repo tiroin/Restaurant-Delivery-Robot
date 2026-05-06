@@ -225,6 +225,8 @@ select.rsel{width:100%;padding:7px 9px;border:1.5px solid #e0e0e0;border-radius:
     <div class="dbg-row" id="dbg-cal">—</div>
     <div class="dbg-sec">Replay segment timing</div>
     <div class="dbg-row" id="dbg-replay">—</div>
+    <div class="dbg-sec" style="background:#4a1010;color:#faa">⛔ Obstacle / Emergency-stop log (newest first)</div>
+    <div class="dbg-row" id="dbg-obstacle" style="font-family:monospace;font-size:.72rem;white-space:pre-wrap">—</div>
     <div class="dbg-sec">Event log (newest first)</div>
     <div class="dbg-log" id="dbg-log">—</div>
   </div>
@@ -281,6 +283,8 @@ var dbg = {
   calResult: null,         /* filled on completion */
   /* replay segment timing */
   replayLog: [],           /* [{dir, cmdMs, actualMs, lag}] */
+  /* obstacle / emergency-stop log */
+  obstacleLog: [],         /* [{ts, event, replayI, segs, pendingCb, wdg, seq}] */
   /* event log */
   events: [],              /* [{ts, tag, detail, cls}] */
   /* BLE TX log — every write recorded for ordering analysis */
@@ -809,6 +813,9 @@ function onOdometry(dir, s1, s2) {
   }
   /* Resolve pending replay step-count callback — only if direction matches */
   if (pendingOdoCb && dirMatch) {
+    if (obstacleActive) {
+      _obsLog('ODO-WHILE-PAUSED', 'dir='+_DN[dir]+' s1='+s1+' s2='+s2+' steps='+steps);
+    }
     var cb = pendingOdoCb;
     pendingOdoCb = null;
     pendingOdoDir = -1;
@@ -1059,16 +1066,19 @@ function driveFor(dir, ms, onDone, stepsTarget) {
     /* Watchdog factored into a (re)startable function so onPathClear()
        can restart it after an obstacle pause without losing pendingOdoCb. */
     function _armWdg(extraMs) {
+      var _armTs = Date.now();
       return setTimeout(function() {
         if (pendingOdoSeq !== _mySeq || !pendingOdoCb) return; /* already resolved */
         if (obstacleActive) { /* still paused — do not fire */
-          dbgEvent('SC-WDG-skip', 'obstacleActive — wdg deferred', 'W');
+          _obsLog('WDG-DEFERRED', 'obstacleActive=true odoSeq='+pendingOdoSeq+' mySeq='+_mySeq);
           _scWdg = _armWdg(ms);  /* re-arm conservatively */
           return;
         }
+        var _wdgMs = Date.now() - _scStart;
+        _obsLog('WDG-FIRED', 'NO-ODO after '+_wdgMs+'ms dir='+_DN[dir]+' seq='+_mySeq+
+                ' obstacleActive='+obstacleActive+' pendingCb=true');
         pendingOdoCb = null;
         pendingOdoDir = -1;
-        var _wdgMs = Date.now() - _scStart;
         dbgEvent('SC-WDG', _DN[dir]+' NO ODO after '+_wdgMs+'ms (exp '+ms+'ms)', 'E');
         send({cmd:'stop'});
         applyTime(dir, ms);
@@ -1147,6 +1157,7 @@ function doReplay(segments, onDone) {
   function next(prevLag) {
     if (!replaying || i >= segments.length) {
       dbgEvent('doReplay-end', 'i='+i+'/'+segments.length+' replaying='+replaying, 'G');
+      _replayI = -1; _replayN = -1;
       replaying = false;
       stopMove();
       setReplayBtn(false);
@@ -1154,6 +1165,7 @@ function doReplay(segments, onDone) {
       return;
     }
     var seg = segments[i++];
+    _replayI = i; _replayN = segments.length;
     /* Subtract previous segment's overrun so error doesn't accumulate */
     var adjDur = Math.max(50, seg.dur - Math.max(0, prevLag || 0));
     var useStepCount = (seg.steps || 0) >= 200;
@@ -1829,6 +1841,32 @@ function refreshDebug() {
   repEl.textContent = repLine;
   repEl.className = 'dbg-row' + (anyLag ? ' W' : '');
 
+  /* ── Obstacle / Emergency-stop log ── */
+  var obsEl = document.getElementById('dbg-obstacle');
+  if (obsEl) {
+    if (dbg.obstacleLog.length === 0) {
+      obsEl.textContent = 'No obstacle events yet.';
+      obsEl.className = 'dbg-row';
+    } else {
+      var active = obstacleActive ? ' \u26d4 ACTIVE\n' : ' \u2705 CLEAR\n';
+      var state  = 'pendingOdoCb=' + (!!pendingOdoCb) +
+                   '  wdgArmed=' + (!!_scWdg) +
+                   '  restartFn=' + (!!_scWdgRestart) +
+                   '  replay=' + _replayI + '/' + _replayN + '\n';
+      obsEl.textContent = active + state +
+        dbg.obstacleLog.slice().reverse().map(function(e) {
+          return '[' + e.ts + '] ' + e.event +
+                 '  replay=' + e.replay +
+                 '  pendingCb=' + e.pendingCb +
+                 '  wdg=' + e.wdgArmed +
+                 '  restartFn=' + e.restartFn +
+                 '  odoSeq=' + e.odoSeq +
+                 (e.extra ? '  ' + e.extra : '');
+        }).join('\n');
+      obsEl.className = 'dbg-row' + (obstacleActive ? ' E' : '');
+    }
+  }
+
   /* ── Event log ── */
   var logEl = document.getElementById('dbg-log');
   logEl.innerHTML = dbg.events.slice().reverse().slice(0, 60).map(function(ev) {
@@ -1848,6 +1886,7 @@ function clearDbgLog() {
   dbg.gyroRateTs = Date.now(); dbg.gyroRateCount = 0; dbg.gyroRate = 0;
   dbg.accelRateTs = Date.now(); dbg.accelRateCount = 0; dbg.accelRate = 0;
   dbg.timerFireTs = 0; dbg.gyroPktTs = 0; dbg.accelPktTs = 0; dbg.wsPktTs = 0;
+  dbg.obstacleLog = [];
   dbg.maxBlockMs = 0; dbg.blockEvents = 0; dbg.watchdogPrevTs = Date.now();
   refreshDebug();
 }
@@ -1861,7 +1900,8 @@ function copyDbgAll() {
     ['Recent gaps ≥400ms',         'dbg-gaps'],
     ['setInterval jitter',         'dbg-timer'],
     ['Calibration',                'dbg-cal'],
-    ['Replay segment timing',      'dbg-replay']
+    ['Replay segment timing',      'dbg-replay'],
+    ['Obstacle / Emergency log',    'dbg-obstacle']
   ];
   var lines = [];
   lines.push('=== ROBOT DEBUG SNAPSHOT ===');
@@ -1874,6 +1914,9 @@ function copyDbgAll() {
   lines.push('pose: x=' + posX.toFixed(0) + ' y=' + posY.toFixed(0) +
              ' heading=' + heading.toFixed(1) + '°  gyroHeading=' + gyroHeading.toFixed(1) + '°');
   lines.push('tripLog: ' + tripLog.length + ' segments  recording=' + recording + '  replaying=' + replaying);
+  lines.push('obstacle: active=' + obstacleActive + '  pendingOdoCb=' + (!!pendingOdoCb) +
+             '  wdgArmed=' + (!!_scWdg) + '  restartFn=' + (!!_scWdgRestart) +
+             '  replay=' + _replayI + '/' + _replayN);
   lines.push('');
   sections.forEach(function(pair) {
     var el = document.getElementById(pair[1]);
@@ -1925,6 +1968,7 @@ function copyDbgLog() {
     gapLog: dbg.gapLog,
     calResult: dbg.calResult,
     replayLog: dbg.replayLog,
+    obstacleLog: dbg.obstacleLog,
     events: dbg.events
   };
   var txt = JSON.stringify(data, null, 2);
