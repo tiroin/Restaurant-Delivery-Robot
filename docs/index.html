@@ -648,6 +648,10 @@ function onBleNotify(event) {
     onAckCP(d.cp_id, d.result);
   } else if (d.type === 'odo') {
     onOdometry(d.dir, d.s1, d.s2);
+  } else if (d.type === 'obstacle') {
+    onObstacle();
+  } else if (d.type === 'path_clear') {
+    onPathClear();
   } else if (d.type === 'order') {
     onOrder(d);
   } else {
@@ -755,6 +759,42 @@ var pendingOdoSeg = -1;   /* tripLog index awaiting hardware step-count update *
 var pendingOdoCb  = null; /* callback(steps) waiting for odo ACK during step-count replay */
 var pendingOdoDir = -1;   /* dir expected by pendingOdoCb; odo with different dir is discarded */
 var pendingOdoSeq = 0;    /* monotonic token; stale odo closures self-discard on mismatch */
+
+/* ─── Obstacle / emergency-stop pause state ───────────────────
+   When MCU3 detects an obstacle (BLE notify {type:"obstacle",state:1}),
+   MCU2 halts motors and saves the current leg's remainder internally.
+   The browser must NOT advance the replay loop while paused: we
+   clear the active watchdog (stash it for restart on path_clear)
+   and freeze the status display.  When path_clear arrives, MCU2
+   resumes the saved leg and eventually sends the odo frame, which
+   resolves the still-armed pendingOdoCb normally.                */
+var _scWdg        = null; /* active watchdog handle for current SC leg */
+var _scWdgRestart = null; /* function to restart wdg with fresh timeout */
+var obstacleActive = false;
+var _stBeforeObstacle = '';
+
+/* Called when MCU3 reports an obstacle (BLE notify {type:"obstacle"}).
+   MCU2 has already halted the motors and saved the current leg's
+   remainder internally.  We must NOT advance the replay loop \u2014 just
+   freeze the watchdog and surface a status message.  When path_clear
+   arrives, MCU2 resumes the saved leg and finally sends odo, which
+   resolves the still-armed pendingOdoCb normally.                   */
+function onObstacle() {
+  if (obstacleActive) return;
+  obstacleActive = true;
+  if (_scWdg) { clearTimeout(_scWdg); _scWdg = null; }
+  _stBeforeObstacle = document.getElementById('stmsg').textContent || '';
+  dbgEvent('obstacle', 'PAUSE \u2014 wdg frozen, pendingCb='+(!!pendingOdoCb), 'W');
+  setSt('\u26d4 Obstacle detected \u2014 paused (waiting for path clear\u2026)');
+}
+function onPathClear() {
+  if (!obstacleActive) return;
+  obstacleActive = false;
+  dbgEvent('path-clear', 'RESUME \u2014 wdg re-armed, pendingCb='+(!!pendingOdoCb), 'G');
+  if (_scWdgRestart && pendingOdoCb) _scWdgRestart();
+  if (_stBeforeObstacle) setSt(_stBeforeObstacle + ' (resumed)');
+  else                   setSt('\u2705 Path clear \u2014 resuming');
+}
 
 /* Called when CAN 0x214 odometry frame arrives from MCU2. */
 function onOdometry(dir, s1, s2) {
@@ -1016,16 +1056,28 @@ function driveFor(dir, ms, onDone, stepsTarget) {
     var _mySeq = ++pendingOdoSeq;
     dbgEvent('SC-start', _DN[dir]+' tgt='+stepsTarget+' exp='+ms+'ms seq='+_mySeq+' bleOK='+ok, 'G');
     send({cmd:'move', dir:dir, steps:stepsTarget});
-    var wdg = setTimeout(function() {
-      if (pendingOdoSeq !== _mySeq || !pendingOdoCb) return; /* already resolved */
-      pendingOdoCb = null;
-      pendingOdoDir = -1;
-      var _wdgMs = Date.now() - _scStart;
-      dbgEvent('SC-WDG', _DN[dir]+' NO ODO after '+_wdgMs+'ms (exp '+ms+'ms)', 'E');
-      send({cmd:'stop'});
-      applyTime(dir, ms);
-      setTimeout(function() { onDone(0); }, 100);
-    }, ms * 2 + 2000);
+    /* Watchdog factored into a (re)startable function so onPathClear()
+       can restart it after an obstacle pause without losing pendingOdoCb. */
+    function _armWdg(extraMs) {
+      return setTimeout(function() {
+        if (pendingOdoSeq !== _mySeq || !pendingOdoCb) return; /* already resolved */
+        if (obstacleActive) { /* still paused — do not fire */
+          dbgEvent('SC-WDG-skip', 'obstacleActive — wdg deferred', 'W');
+          _scWdg = _armWdg(ms);  /* re-arm conservatively */
+          return;
+        }
+        pendingOdoCb = null;
+        pendingOdoDir = -1;
+        var _wdgMs = Date.now() - _scStart;
+        dbgEvent('SC-WDG', _DN[dir]+' NO ODO after '+_wdgMs+'ms (exp '+ms+'ms)', 'E');
+        send({cmd:'stop'});
+        applyTime(dir, ms);
+        setTimeout(function() { onDone(0); }, 100);
+      }, ms * 2 + 2000 + (extraMs||0));
+    }
+    _scWdg = _armWdg(0);
+    _scWdgRestart = function() { _scWdg = _armWdg(0); };
+    var wdg = _scWdg;
     pendingOdoDir = dir;
     pendingOdoCb = function(steps) {
       if (pendingOdoSeq !== _mySeq) {
@@ -1033,6 +1085,8 @@ function driveFor(dir, ms, onDone, stepsTarget) {
         return;
       }
       clearTimeout(wdg);
+      if (_scWdg) clearTimeout(_scWdg);
+      _scWdg = null; _scWdgRestart = null;
       var _scMs = Date.now() - _scStart;
       dbgEvent('SC-odo-cb', _DN[dir]+' steps='+steps+' actual='+_scMs+'ms exp='+ms+'ms', 'G');
       dbgRolling(dbg.replayLog, { dir:dir, cmdMs:ms, actualMs:_scMs, lag:_scMs-ms, mode:'SC' }, 40);

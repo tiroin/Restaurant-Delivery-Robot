@@ -169,6 +169,7 @@ static void canRxTask(void *arg)
 
         case 0x301: {  /* OBSTACLE_ALERT from MCU3 (data[0]=0xA1) — front sensor <15cm */
             ESP_LOGW(TAG, "[canRx] >>> OBSTACLE 0x301 (front <15cm) <<<");
+            wifi_ap_ws_set_emergency(true);  /* block move/stop from web UI */
             snprintf(ws_json, sizeof(ws_json),
                      "{\"type\":\"obstacle\",\"state\":1}");
             ble_robot_notify(ws_json);
@@ -177,6 +178,7 @@ static void canRxTask(void *arg)
 
         case 0x303: {  /* PATH_CLEAR from MCU3 (data[0]=0xC1) — front clear */
             ESP_LOGI(TAG, "[canRx] >>> PATH_CLEAR 0x303 <<<");
+            wifi_ap_ws_set_emergency(false);  /* re-enable move/stop from web UI */
             snprintf(ws_json, sizeof(ws_json),
                      "{\"type\":\"path_clear\",\"state\":0}");
             ble_robot_notify(ws_json);

@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -61,6 +62,13 @@ void wifi_ap_ws_set_tables(const char *tables_array);
  *        Called from BLE cmd handler when cmd=order_delivered arrives.
  */
 void wifi_ap_ws_mark_delivered(const char *table);
+
+/**
+ * @brief Set or clear the emergency-stop flag.
+ *        While active, move/stop WS commands are silently dropped.
+ *        Called from canRxTask on 0x301 (obstacle) / 0x303 (path clear).
+ */
+void wifi_ap_ws_set_emergency(bool active);
 
 #ifdef __cplusplus
 }

@@ -72,6 +72,16 @@ static char              s_selected[MAX_TABLES][MAX_TABLE_NAME];
 static int               s_selected_count = 0;
 static SemaphoreHandle_t s_selected_mutex = NULL;
 
+/* ── Emergency stop flag (set by app_main canRxTask on 0x301/0x303) ─── */
+static volatile bool     s_emergency_active = false;
+
+void wifi_ap_ws_set_emergency(bool active)
+{
+    s_emergency_active = active;
+    ESP_LOGW(TAG, "[EMRG] emergency=%d — CAN move/stop %s",
+             (int)active, active ? "BLOCKED" : "RESUMED");
+}
+
 /* Load table list from NVS into s_tables_json */
 static void tables_load_nvs(void)
 {
@@ -166,6 +176,10 @@ static void handle_ws_message(const char *msg)
 
     if (strcmp(cmd, "move") == 0) {
         /* {"cmd":"move","dir":0-3,"steps":N,"speed":N} */
+        if (s_emergency_active) {
+            ESP_LOGW(TAG, "[EMRG] move cmd BLOCKED (emergency active)");
+            return;
+        }
         uint8_t  dir   = (uint8_t)json_get_int(msg, "dir",   0);
         uint16_t steps = (uint16_t)json_get_int(msg, "steps", 0);
         uint16_t speed = 4000;  /* always CRAWL — 125 steps/s */
@@ -179,6 +193,10 @@ static void handle_ws_message(const char *msg)
 
     } else if (strcmp(cmd, "stop") == 0) {
         /* {"cmd":"stop"} */
+        if (s_emergency_active) {
+            ESP_LOGW(TAG, "[EMRG] stop cmd BLOCKED (emergency active)");
+            return;
+        }
         uint8_t data[5] = {0};
         can_tx(CAN_ID_MANUAL_MOVE, data, sizeof(data));
 
