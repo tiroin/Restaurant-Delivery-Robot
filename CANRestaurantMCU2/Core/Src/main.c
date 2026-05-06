@@ -639,15 +639,18 @@ static void canRxTask(void *arg) {
 				speed = STEPPER_SPEED_CRAWL;
 			if (dir > 3)
 				steps = 0;
-			/* While emergency is active, REJECT forward/turn moves so the
-			 * HTML's continuous leg-streaming cannot defeat the stop.
-			 * Only PATH_CLEAR (0x303) from MCU3 lifts the lock — that fires
-			 * automatically when the front sensor reads >= 15 cm again. */
+			/* While emergency is active: don't move, but DO record the
+			 * latest pending leg so path accounting stays consistent and
+			 * so we can replay it when MCU3 reports PATH_CLEAR (0x303). */
 			if (g_emergencyStop) {
+				g_savedDir = dir;
+				g_savedRem1 = steps;
+				g_savedRem2 = steps;
+				g_savedSpeed = speed;
 				NavCmd_t stop = { 0, 0, 0 };
 				xQueueOverwrite(stepQueue1, &stop);
 				xQueueOverwrite(stepQueue2, &stop);
-				PRINT("[EMRG] DROP MANUAL_MOVE dir=%u steps=%u (stop held)\r\n",
+				PRINT("[EMRG] HOLD MANUAL_MOVE dir=%u steps=%u (saved for replay)\r\n",
 						dir, steps);
 				break;
 			}
@@ -679,13 +682,20 @@ static void canRxTask(void *arg) {
 			break;
 		}
 		case CAN_ID_PATH_CLEAR: {
-			/* Path clear — only clear the sticky flag so subsequent
-			 * MANUAL_MOVE commands are accepted again. Do NOT auto-resume
-			 * (HTML drives the next leg explicitly).                    */
+			/* Path clear — lift the lock and replay the most recently saved
+			 * MANUAL_MOVE so the leg resumes from where it was interrupted. */
 			if (g_emergencyStop) {
 				g_emergencyStop = false;
-				PRINT("[EMRG] CLEAR (rem1=%u rem2=%u still pending)\r\n",
-						g_savedRem1, g_savedRem2);
+				if (g_savedRem1 > 0 || g_savedRem2 > 0) {
+					uint16_t speed = g_savedSpeed ? g_savedSpeed : STEPPER_SPEED_CRAWL;
+					NavCmd_t cmd = { g_savedDir, g_savedRem1, speed };
+					xQueueOverwrite(stepQueue1, &cmd);
+					xQueueOverwrite(stepQueue2, &cmd);
+					PRINT("[EMRG] CLEAR -> replay dir=%u steps=%u\r\n",
+							g_savedDir, g_savedRem1);
+				} else {
+					PRINT("[EMRG] CLEAR (nothing to replay)\r\n");
+				}
 			}
 			break;
 		}
