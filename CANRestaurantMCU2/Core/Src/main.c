@@ -110,12 +110,21 @@ static volatile uint32_t motor2_steps = 0;
 static volatile uint32_t stepTarget1 = 0;   /* 0 = unlimited; ISR self-stops when reached */
 static volatile uint32_t stepTarget2 = 0;
 
-/* ── Emergency-stop state (set by 0x302, cleared by 0x303 or next MANUAL_MOVE) ── */
+/* ── Emergency-stop state (set by 0x302, cleared by 0x303) ─────────────
+ * On 0x302 we snapshot the in-flight leg's remaining steps as the FIRST
+ * entry in g_emrgQ, then every step-count MANUAL_MOVE that arrives during
+ * the emergency is appended to g_emrgQ. On 0x303 we replay the queue in
+ * FIFO order: pop[0] -> push to stepper queues; each leg-completion in
+ * stepperTask1 (around send_odometry) pops the next.                  */
+#define EMRG_QDEPTH 16U
 static volatile bool g_emergencyStop = false;
-static volatile uint8_t g_savedDir = 0;
-static volatile uint16_t g_savedRem1 = 0;
-static volatile uint16_t g_savedRem2 = 0;
-static volatile uint16_t g_savedSpeed = 0;
+static NavCmd_t g_emrgQ[EMRG_QDEPTH];
+static volatile uint8_t g_emrgQHead = 0;   /* next pop  */
+static volatile uint8_t g_emrgQTail = 0;   /* next push */
+static volatile uint8_t g_emrgQCount = 0;
+/* Last MANUAL_MOVE issued (used to build the in-flight remainder leg). */
+static volatile uint8_t  g_curDir   = 0;
+static volatile uint16_t g_curSpeed = 0;
 
 /* ── Forward declarations ────────────────────────────────────── */
 void SystemClock_Config(void);
@@ -291,6 +300,56 @@ static void stepper2_stop(void) {
 	HAL_TIM_Base_Stop_IT(&htim3);
 	HAL_GPIO_WritePin(STEP2_PORT, STEP2_PIN, GPIO_PIN_RESET);
 }
+
+/* ── Emergency replay FIFO helpers ──────────────────────────────
+ * All callers run in task context; canRxTask is highest-prio of the
+ * three writers (canRx > stepperTask1/2). Brief critical sections
+ * via taskENTER_CRITICAL keep head/tail/count consistent. */
+static bool emrgQ_push(NavCmd_t cmd) {
+	bool ok = false;
+	taskENTER_CRITICAL();
+	if (g_emrgQCount < EMRG_QDEPTH) {
+		g_emrgQ[g_emrgQTail] = cmd;
+		g_emrgQTail = (uint8_t)((g_emrgQTail + 1U) % EMRG_QDEPTH);
+		g_emrgQCount++;
+		ok = true;
+	}
+	taskEXIT_CRITICAL();
+	return ok;
+}
+static bool emrgQ_pop(NavCmd_t *out) {
+	bool ok = false;
+	taskENTER_CRITICAL();
+	if (g_emrgQCount > 0) {
+		*out = g_emrgQ[g_emrgQHead];
+		g_emrgQHead = (uint8_t)((g_emrgQHead + 1U) % EMRG_QDEPTH);
+		g_emrgQCount--;
+		ok = true;
+	}
+	taskEXIT_CRITICAL();
+	return ok;
+}
+static void emrgQ_clear(void) __attribute__((unused));
+static void emrgQ_clear(void) {
+	taskENTER_CRITICAL();
+	g_emrgQHead = g_emrgQTail = g_emrgQCount = 0;
+	taskEXIT_CRITICAL();
+}
+/* Pop the next pending leg (if any) and dispatch to stepper queues.
+ * Used by 0x303 to kick off replay and by stepperTask1 to chain the
+ * next leg after each completion. No-op while emergency is active. */
+static void emrgQ_advance(const char *why) {
+	if (g_emergencyStop)
+		return;
+	NavCmd_t cmd;
+	if (!emrgQ_pop(&cmd))
+		return;
+	xQueueOverwrite(stepQueue1, &cmd);
+	xQueueOverwrite(stepQueue2, &cmd);
+	PRINT("[EMRG] %s -> replay dir=%u steps=%u (q=%u left)\r\n",
+			why ? why : "advance", cmd.dir, cmd.steps, g_emrgQCount);
+}
+
 /* Send odometry CAN frame (called by stepperTask1 only). */
 static void send_odometry(uint8_t dir) {
 	uint16_t s1 = (uint16_t)(motor1_steps > 0xFFFF ? 0xFFFF : motor1_steps);
@@ -468,6 +527,7 @@ static void stepperTask1(void *arg) {
 					stepper1_stop(); stepTarget1 = 0;
 					running = false; stepMode = false;
 					send_odometry(lastDir);
+					emrgQ_advance("S1-stop-chain");
 				}
 				continue;
 			}
@@ -483,6 +543,7 @@ static void stepperTask1(void *arg) {
 			NavCmd_t drain;
 			while (xQueueReceive(stepQueue1, &drain, 0) == pdTRUE) {}
 			send_odometry(lastDir);
+			emrgQ_advance("S1-done-chain");
 			continue;
 		}
 		/* ── Normal mode: wait for queue command ── */
@@ -502,6 +563,7 @@ static void stepperTask1(void *arg) {
 				stepper1_stop(); stepTarget1 = 0;
 				running = false;
 				send_odometry(lastDir);
+				emrgQ_advance("S1-timeout-chain");
 			}
 			continue;
 		}
@@ -639,20 +701,27 @@ static void canRxTask(void *arg) {
 				speed = STEPPER_SPEED_CRAWL;
 			if (dir > 3)
 				steps = 0;
-			/* While emergency is active: don't move, but DO record the
-			 * latest pending leg so path accounting stays consistent and
-			 * so we can replay it when MCU3 reports PATH_CLEAR (0x303). */
+			/* During emergency: motors stay halted, but every step-count leg
+			 * is appended to the replay FIFO so the path is preserved.
+			 * Keepalives (steps < threshold) are not legs — ignore them.    */
 			if (g_emergencyStop) {
-				g_savedDir = dir;
-				g_savedRem1 = steps;
-				g_savedRem2 = steps;
-				g_savedSpeed = speed;
+				if (steps >= STEP_COUNT_THRESHOLD) {
+					NavCmd_t leg = { dir, steps, speed };
+					bool ok = emrgQ_push(leg);
+					PRINT("[EMRG] HOLD MANUAL_MOVE dir=%u steps=%u %s (q=%u)\r\n",
+							dir, steps,
+							ok ? "queued" : "DROPPED-FULL", g_emrgQCount);
+				}
+				/* Re-assert stop so the 300ms keepalive timeout never restarts. */
 				NavCmd_t stop = { 0, 0, 0 };
 				xQueueOverwrite(stepQueue1, &stop);
 				xQueueOverwrite(stepQueue2, &stop);
-				PRINT("[EMRG] HOLD MANUAL_MOVE dir=%u steps=%u (saved for replay)\r\n",
-						dir, steps);
 				break;
+			}
+			/* Track latest leg so 0x302 can capture the in-flight remainder. */
+			if (steps >= STEP_COUNT_THRESHOLD) {
+				g_curDir = dir;
+				g_curSpeed = speed;
 			}
 			NavCmd_t cmd = { dir, steps, speed };
 			xQueueOverwrite(stepQueue1, &cmd); /* latest command wins */
@@ -661,38 +730,40 @@ static void canRxTask(void *arg) {
 			break;
 		}
 		case CAN_ID_EMERGENCY_STOP: {
-			/* MCU3 detected obstacle <15cm in front. Snapshot remaining work,
-			 * stop motors immediately, set flag so any in-flight MANUAL_MOVE
-			 * is replaced by a stop. */
+			/* MCU3 detected obstacle <15cm in front. Capture the in-flight
+			 * leg's remaining steps as the FIRST entry in the replay FIFO,
+			 * stop motors immediately, set the lock flag.                  */
 			uint32_t cur1 = motor1_steps;
 			uint32_t tgt1 = stepTarget1;
 			uint32_t cur2 = motor2_steps;
 			uint32_t tgt2 = stepTarget2;
 			uint32_t rem1 = (tgt1 > cur1) ? (tgt1 - cur1) : 0;
 			uint32_t rem2 = (tgt2 > cur2) ? (tgt2 - cur2) : 0;
-			g_savedRem1 = (rem1 > 0xFFFFU) ? 0xFFFFU : (uint16_t) rem1;
-			g_savedRem2 = (rem2 > 0xFFFFU) ? 0xFFFFU : (uint16_t) rem2;
-			/* g_savedDir/g_savedSpeed: best-effort capture — last MANUAL_MOVE
-			 * is unknown here; HTML/MCU1 retransmit on resume anyway.        */
+			uint32_t rem = (rem1 > rem2) ? rem1 : rem2; /* dominant axis */
 			g_emergencyStop = true;
 			NavCmd_t stop = { 0, 0, 0 };
 			xQueueOverwrite(stepQueue1, &stop);
 			xQueueOverwrite(stepQueue2, &stop);
-			PRINT("[EMRG] STOP rem1=%u rem2=%u\r\n", g_savedRem1, g_savedRem2);
+			if (rem > 0) {
+				uint16_t rem16 = (rem > 0xFFFFU) ? 0xFFFFU : (uint16_t) rem;
+				uint16_t spd = g_curSpeed ? g_curSpeed : STEPPER_SPEED_CRAWL;
+				NavCmd_t leg = { g_curDir, rem16, spd };
+				(void) emrgQ_push(leg); /* head of replay queue */
+				PRINT("[EMRG] STOP rem=%u dir=%u (q=%u)\r\n", rem16,
+						g_curDir, g_emrgQCount);
+			} else {
+				PRINT("[EMRG] STOP (no in-flight leg, q=%u)\r\n", g_emrgQCount);
+			}
 			break;
 		}
 		case CAN_ID_PATH_CLEAR: {
-			/* Path clear — lift the lock and replay the most recently saved
-			 * MANUAL_MOVE so the leg resumes from where it was interrupted. */
+			/* Path clear — lift the lock and kick off replay of the queued
+			 * legs in FIFO order. Subsequent legs are chained automatically
+			 * by stepperTask1 calling emrgQ_advance() after each completion.*/
 			if (g_emergencyStop) {
 				g_emergencyStop = false;
-				if (g_savedRem1 > 0 || g_savedRem2 > 0) {
-					uint16_t speed = g_savedSpeed ? g_savedSpeed : STEPPER_SPEED_CRAWL;
-					NavCmd_t cmd = { g_savedDir, g_savedRem1, speed };
-					xQueueOverwrite(stepQueue1, &cmd);
-					xQueueOverwrite(stepQueue2, &cmd);
-					PRINT("[EMRG] CLEAR -> replay dir=%u steps=%u\r\n",
-							g_savedDir, g_savedRem1);
+				if (g_emrgQCount > 0) {
+					emrgQ_advance("CLEAR");
 				} else {
 					PRINT("[EMRG] CLEAR (nothing to replay)\r\n");
 				}
